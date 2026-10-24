@@ -17,6 +17,11 @@ mod paths;
 // drop the escape hatch once they do.
 #[allow(dead_code)]
 mod store;
+// Subscription format sniffing: unit tests pin the API, but nothing consumes
+// it until the import flow (task 5) and the merge worker (task 7) land —
+// drop the escape hatch once they do.
+#[allow(dead_code)]
+mod subscription;
 mod ui;
 
 use std::process::ExitCode;
