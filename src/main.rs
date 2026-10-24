@@ -7,6 +7,11 @@
 
 mod api;
 mod app;
+// Foundation for the subscription feature: unit tests pin the API below, but
+// no production code consumes it until the profile worker and the test pool
+// land — drop the escape hatch once they do.
+#[allow(dead_code)]
+mod paths;
 mod ui;
 
 use std::process::ExitCode;
@@ -33,6 +38,8 @@ OPTIONS:
     --timeout <MS>       Per-test timeout in ms      [default: 5000]
     --refresh <MS>       State refresh interval in ms [default: 2000]
     --log-level <LEVEL>  Log stream level: debug|info|warning|error [default: info]
+    --config-dir <DIR>   Directory for profiles, configs and TUI settings
+    --concurrency <N>    Parallel delay tests        [default: 8]
     -h, --help           Print this help
 
 KEYS:
@@ -50,6 +57,13 @@ struct Options {
     timeout_ms: u64,
     refresh_ms: u64,
     log_level: String,
+    /// Relocates the whole mihomo-tui state tree; resolved by `Paths`.
+    // Read together with the paths module once subscription management lands.
+    #[allow(dead_code)]
+    config_dir: Option<String>,
+    /// Overrides the concurrency stored in `config.json` for delay tests.
+    #[allow(dead_code)]
+    concurrency: Option<usize>,
 }
 
 impl Default for Options {
@@ -61,6 +75,8 @@ impl Default for Options {
             timeout_ms: api::DEFAULT_TIMEOUT_MS,
             refresh_ms: 2000,
             log_level: api::DEFAULT_LOG_LEVEL.to_string(),
+            config_dir: None,
+            concurrency: None,
         }
     }
 }
@@ -103,6 +119,18 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Options>>
                 })?;
             }
             "--log-level" => options.log_level = value(&flag)?,
+            "--config-dir" => options.config_dir = Some(value(&flag)?),
+            "--concurrency" => {
+                let raw = value(&flag)?;
+                options.concurrency = Some(
+                    raw.parse::<usize>()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| {
+                            anyhow!("--concurrency expects a positive integer, got `{raw}`")
+                        })?,
+                );
+            }
             other => return Err(anyhow!("unknown option `{other}`\n\n{USAGE}")),
         }
     }
@@ -522,6 +550,30 @@ mod tests {
             "non-numeric timeout"
         );
         assert!(parse(&["--refresh", "x"]).is_err(), "non-numeric refresh");
+    }
+
+    #[test]
+    fn parses_config_dir_and_concurrency() {
+        let options = parse(&["--config-dir", "/x", "--concurrency", "16"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.config_dir.as_deref(), Some("/x"));
+        assert_eq!(options.concurrency, Some(16));
+
+        let inline = parse(&["--concurrency=4", "--config-dir=/y"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(inline.concurrency, Some(4));
+        assert_eq!(inline.config_dir.as_deref(), Some("/y"));
+
+        assert!(
+            parse(&["--concurrency", "abc"]).is_err(),
+            "non-numeric concurrency"
+        );
+        assert!(
+            parse(&["--concurrency", "0"]).is_err(),
+            "concurrency must be at least 1"
+        );
     }
 
     #[test]
