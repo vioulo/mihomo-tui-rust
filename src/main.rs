@@ -7,6 +7,11 @@
 
 mod api;
 mod app;
+// Atomic file replacement shared by the persistence layers: unit tests pin
+// the behavior, but nothing consumes it until the profile worker (task 11)
+// wires the write path — drop the escape hatch once they do.
+#[allow(dead_code)]
+mod atomic;
 // Foundation for the subscription feature: unit tests pin the API below, but
 // no production code consumes it until the profile worker and the test pool
 // land — drop the escape hatch once they do.
@@ -28,6 +33,11 @@ mod subscription;
 // escape hatch once they do.
 #[allow(dead_code)]
 mod merge;
+// Runtime config rendering: unit tests pin the API, but nothing consumes it
+// until the confirm page (task 10) and the profile worker (task 11) land —
+// drop the escape hatch once they do.
+#[allow(dead_code)]
+mod runtime;
 mod ui;
 
 use std::process::ExitCode;

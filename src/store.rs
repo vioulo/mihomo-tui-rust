@@ -3,19 +3,19 @@
 //!
 //! Everything here is deliberately boring file plumbing. Subscriptions can
 //! embed credentials, so both artifacts are written 0600, and every write
-//! goes through a same-directory tmp file + `rename` so a crash can never
-//! leave a truncated `profiles.json` behind — losing the index would orphan
-//! every snapshot.
+//! goes through the shared atomic replacement ([`crate::atomic`]) so a crash
+//! can never leave a truncated `profiles.json` behind — losing the index
+//! would orphan every snapshot.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::atomic::write_atomic;
 use crate::paths::Paths;
 
 /// One imported subscription, as listed in `profiles.json`.
@@ -57,7 +57,7 @@ impl Store {
     /// Rewrite the whole profile index as 0600.
     pub fn save_profiles(p: &Paths, v: &[ProfileMeta]) -> Result<()> {
         let text = serde_json::to_string_pretty(v).context("serializing profiles")?;
-        atomic_write(&p.profiles_json(), &text)
+        write_atomic(&p.profiles_json(), &text)
     }
 
     /// Append a profile, assign its id, and store the downloaded text as its
@@ -149,7 +149,7 @@ impl Store {
 
     /// Store the raw downloaded text for a profile (0600, atomic).
     pub fn write_snapshot(p: &Paths, id: &str, raw: &str) -> Result<()> {
-        atomic_write(&Self::snapshot_path(p, id), raw)
+        write_atomic(&Self::snapshot_path(p, id), raw)
     }
 
     /// Read back a profile's raw text. A missing snapshot is an error —
@@ -170,27 +170,6 @@ fn next_id(profiles: &[ProfileMeta]) -> String {
         .max()
         .unwrap_or(0);
     format!("s{}", highest + 1)
-}
-
-/// Overwrite `path` atomically: write a sibling tmp file, then rename it over
-/// the target, so a crash mid-write leaves the previous content intact
-/// instead of a truncated file. The tmp file is chmod'ed 0600 before the
-/// rename, so the artifact never becomes visible under its real name with
-/// looser permissions. [`Paths::ensure`] must have run first.
-fn atomic_write(path: &Path, data: &str) -> Result<()> {
-    let dir = path.parent().context("target path has no parent")?;
-    let name = path.file_name().context("target path has no file name")?;
-    let tmp = dir.join(format!("{}.tmp", name.to_string_lossy()));
-
-    fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
-    // Subscriptions embed credentials: the mode is fixed while the file is
-    // still only the tmp name.
-    let mut permissions = fs::metadata(&tmp)?.permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(&tmp, permissions)
-        .with_context(|| format!("restricting {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("moving {} into place", tmp.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
