@@ -1,4 +1,4 @@
-//! Subscription format sniffing and share-link parsing.
+//! Subscription download, format sniffing, and share-link parsing.
 //!
 //! A subscription URL hands back one of three shapes: a full Clash/mihomo
 //! config (top-level YAML mapping carrying a `proxies` sequence), a
@@ -11,14 +11,23 @@
 //! converter protocol list. Links with any other scheme are recorded in the
 //! report as skipped, never fatal: the link-list shape sniffs on the generic
 //! `scheme://` form, not on the supported list.
+//!
+//! On top of the parsers sit the two production entry points:
+//! [`download`] fetches a subscription URL, and [`import_from_raw`] turns
+//! raw text into a stored profile — parse first, persist second, so a
+//! subscription that cannot be read never leaves files behind.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use serde_yaml_ng::{Mapping, Sequence, Value};
 use url::Url;
+
+use crate::paths::Paths;
+use crate::store::{ProfileMeta, Store};
 
 /// What an import brought in, for toasts and the profile list.
 #[derive(Debug, Default)]
@@ -448,8 +457,103 @@ fn summarize(report: &ImportReport) -> String {
         .join(", ")
 }
 
+/// Whole-request budget for [`download`]: connect, redirects, and body.
+/// A subscription fetch is an interactive UI action, so one total timeout.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest slice of an error body quoted in a failed-download message.
+const BODY_SNIPPET_CHARS: usize = 200;
+
+/// Download a subscription URL and return the body text.
+///
+/// Any status outside 2xx is an error carrying the status code and the
+/// first [`BODY_SNIPPET_CHARS`] characters of the body: providers answer
+/// "expired" or "over quota" with human-readable HTML pages, and that text
+/// is what tells the user why an import found nothing. Not covered by unit
+/// tests on purpose — they must not touch the network — this is verified
+/// where it is wired to the UI.
+pub async fn download(url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .build()
+        .context("building HTTP client")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("requesting {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default().trim().to_string();
+        let truncated = body.chars().count() > BODY_SNIPPET_CHARS;
+        let mut snippet: String = body.chars().take(BODY_SNIPPET_CHARS).collect();
+        if truncated {
+            snippet.push('…');
+        }
+        if snippet.is_empty() {
+            bail!("subscription server returned {status} for {url}");
+        }
+        bail!("subscription server returned {status} for {url}: {snippet}");
+    }
+
+    response
+        .text()
+        .await
+        .with_context(|| format!("reading body of {url}"))
+}
+
+/// The production import entry: parse `raw`, then hand it to the store.
+///
+/// The parse runs before anything touches the disk, so a subscription that
+/// cannot be read leaves no files behind — [`Store::add_profile`] only ever
+/// sees text that already parsed. The meta's `nodes`/`protocols` come from
+/// the parse report, and both timestamps are stamped with the current clock
+/// (this is the production path; tests assert presence, not values).
+///
+/// A parse that yields zero usable nodes but recorded skips is a failed
+/// import too — every entry was rejected, so storing an empty profile would
+/// only move the failure into the UI — and its error carries the skip
+/// summary so the user sees why nothing arrived.
+pub fn import_from_raw(paths: &Paths, name: &str, url: &str, raw: &str) -> Result<ProfileMeta> {
+    let parsed =
+        parse_subscription(raw).with_context(|| format!("importing subscription `{name}`"))?;
+
+    if parsed.report.total_nodes == 0 && !parsed.report.skipped.is_empty() {
+        bail!(
+            "importing subscription `{name}`: 0 nodes, {} skipped: {}",
+            parsed.report.skipped.len(),
+            parsed.report.skipped.join("; ")
+        );
+    }
+
+    let now_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+
+    Store::add_profile(
+        paths,
+        name,
+        url,
+        raw,
+        u32::try_from(parsed.report.total_nodes).unwrap_or(u32::MAX),
+        &summarize(&parsed.report),
+        now_ms,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use crate::paths::Paths;
+    use crate::store::Store;
+
     use super::*;
 
     /// Minimal but realistic Clash config: three proxies plus a group that
@@ -732,6 +836,96 @@ ss://YWVzLTEyODpnY21AdGVzdA@ss2.example.com:443#ss-two
         assert_eq!(text(&node, "obfs"), "salamander");
         assert_eq!(text(&node, "obfs-password"), "op");
         assert_eq!(text(&node, "name"), "名");
+    }
+
+    // ---- import flow: parse → Store::add_profile ----
+
+    /// A throwaway config root with the directory layout already created,
+    /// mirroring what production does once at startup.
+    fn paths() -> (TempDir, Paths) {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::resolve(Some(tmp.path().to_str().unwrap())).unwrap();
+        paths.ensure().unwrap();
+        (tmp, paths)
+    }
+
+    #[tokio::test]
+    async fn import_from_raw_stores_snapshot_and_meta() {
+        let (_tmp, paths) = paths();
+
+        let profile = import_from_raw(&paths, "甲", "https://sub.example", SAMPLE).unwrap();
+
+        // The meta comes from the parse report; the clock is real, so only
+        // its presence is asserted, never a concrete timestamp.
+        assert_eq!(profile.id, "s1");
+        assert_eq!(profile.name, "甲");
+        assert_eq!(profile.url, "https://sub.example");
+        assert_eq!(profile.nodes, 3);
+        assert_eq!(profile.protocols, "trojan(1), vless(2)");
+        assert!(profile.created_ms > 0, "stamped from the current clock");
+        assert_eq!(
+            profile.created_ms, profile.updated_ms,
+            "a fresh import stamps both"
+        );
+        assert!(profile.policy.is_empty());
+
+        // The snapshot holds the exact downloaded text.
+        assert_eq!(Store::read_snapshot(&paths, &profile.id).unwrap(), SAMPLE);
+
+        // And the profile shows up in the index.
+        let profiles = Store::load_profiles(&paths).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, profile.id);
+        assert_eq!(profiles[0].nodes, 3);
+        assert_eq!(profiles[0].protocols, "trojan(1), vless(2)");
+    }
+
+    #[tokio::test]
+    async fn failed_parse_leaves_no_files_behind() {
+        let (_tmp, paths) = paths();
+
+        let err = import_from_raw(&paths, "坏", "https://sub.example", "plain prose, no links")
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("importing subscription") && message.contains("not a Clash/mihomo"),
+            "names the profile and the failing format: {message}"
+        );
+
+        // Nothing reached the disk: no index, no snapshot.
+        assert!(
+            !paths.profiles_json().exists(),
+            "profiles.json was never created"
+        );
+        assert_eq!(
+            fs::read_dir(paths.subscriptions_dir()).unwrap().count(),
+            0,
+            "no snapshot files either"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_entries_skipped_fails_with_the_skip_summary() {
+        // A parse that yields zero usable nodes is a failed import too, and
+        // its error carries the skip report — this is the only parse failure
+        // that has a report to show.
+        let (_tmp, paths) = paths();
+
+        let raw = "\
+ss://YWVzLTEyODpnY21AdGVzdA@ss.example.com:443#one
+ss://YWVzLTEyODpnY21AdGVzdA@ss2.example.com:443#two
+";
+        let err = import_from_raw(&paths, "全跳", "https://sub.example", raw).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("skipped"), "reports the skips: {message}");
+        assert!(
+            message.contains(r#"unsupported scheme "ss""#) && message.contains("line 1"),
+            "carries the skip reasons: {message}"
+        );
+
+        // Still nothing on disk.
+        assert!(!paths.profiles_json().exists());
+        assert_eq!(fs::read_dir(paths.subscriptions_dir()).unwrap().count(), 0);
     }
 
     #[test]
