@@ -12,6 +12,11 @@ mod app;
 // land — drop the escape hatch once they do.
 #[allow(dead_code)]
 mod paths;
+// Subscription persistence: unit tests pin the API, but nothing consumes it
+// until the import flow (task 5) and the profile worker (task 11) land —
+// drop the escape hatch once they do.
+#[allow(dead_code)]
+mod store;
 mod ui;
 
 use std::process::ExitCode;
