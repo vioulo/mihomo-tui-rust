@@ -60,6 +60,15 @@ impl Client {
         self.base.as_str()
     }
 
+    /// The controller secret, for rendering a runtime config whose
+    /// `external-controller` + `secret` match the instance we are talking to.
+    // Consumed by the profile worker (task 11) when it renders and reloads;
+    // until then only tests call it — drop the escape hatch once they do.
+    #[allow(dead_code)]
+    pub fn secret(&self) -> Option<&str> {
+        self.secret.as_deref()
+    }
+
     /// Build `<base>/<segments...>`, percent-encoding each segment so proxy
     /// names with spaces, slashes or emoji survive the trip.
     fn url(&self, segments: &[&str]) -> Result<Url> {
@@ -126,6 +135,23 @@ impl Client {
         Ok(())
     }
 
+    /// Hot-reload the controller with a full config, supplied inline.
+    ///
+    /// `PUT /configs` with `{"payload": <yaml>}` asks a running mihomo to apply
+    /// the YAML without a process restart; the external controller (and so this
+    /// client's endpoint) survives the reload.
+    // Consumed by the profile worker (task 11); until then only tests call it —
+    // drop the escape hatch once they do.
+    #[allow(dead_code)]
+    pub async fn reload_config(&self, yaml_payload: &str) -> Result<()> {
+        Self::send(
+            self.request(Method::PUT, self.url(&["configs"])?)
+                .json(&json!({ "payload": yaml_payload })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// All selector-ish groups with their members, GLOBAL first.
     pub async fn groups(&self) -> Result<Vec<Group>> {
         let resp = Self::send(self.request(Method::GET, self.url(&["proxies"])?)).await?;
@@ -179,7 +205,14 @@ impl Client {
             .append_pair("timeout", &timeout_ms.to_string())
             .append_pair("url", url);
 
-        let resp = Self::send(self.request(Method::GET, endpoint)).await?;
+        // The http client's 10s total timeout would truncate long delay tests,
+        // so give this one request its own ceiling: the probe itself is capped
+        // at `timeout_ms`, plus a grace period for the round trip.
+        let resp = Self::send(
+            self.request(Method::GET, endpoint)
+                .timeout(Duration::from_millis(timeout_ms + 1500)),
+        )
+        .await?;
         let body: DelayResponse = resp.json().await.context("decoding delay result")?;
         if body.delay == 0 {
             let reason = if body.message.is_empty() {
@@ -492,6 +525,130 @@ pub struct LogLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn proxy_delay_timeout_is_per_request() {
+        let server = MockServer::start().await;
+
+        // A controller handed `timeout=100` may still be slow to give up; this
+        // one answers only after 2s, so the client must cut the call at its
+        // request-level ceiling (100 + 1500 = 1600ms) instead of riding the
+        // 10s total timeout to a success that arrives too late to matter.
+        Mock::given(method("GET"))
+            .and(path("/proxies/n1/delay"))
+            .and(query_param("timeout", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"delay":123}"#)
+                    .set_delay(Duration::from_millis(2000)),
+            )
+            .mount(&server)
+            .await;
+        // A generous budget must still accommodate a slow but real success.
+        Mock::given(method("GET"))
+            .and(path("/proxies/n1/delay"))
+            .and(query_param("timeout", "5000"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"delay":123}"#)
+                    .set_delay(Duration::from_millis(800)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri(), None).unwrap();
+
+        let started = Instant::now();
+        let short = client
+            .proxy_delay("n1", "http://example.com/204", 100)
+            .await;
+        let short_elapsed = started.elapsed();
+        assert!(
+            short.is_err(),
+            "a probe past its per-request ceiling fails, got {short:?}"
+        );
+        assert!(
+            short_elapsed >= Duration::from_millis(1500) && short_elapsed <= Duration::from_secs(9),
+            "aborts at the request-level ceiling, not the 10s total: {short_elapsed:?}"
+        );
+
+        let started = Instant::now();
+        let delay = client
+            .proxy_delay("n1", "http://example.com/204", 5000)
+            .await
+            .unwrap();
+        let long_elapsed = started.elapsed();
+        assert_eq!(delay, 123);
+        assert!(
+            long_elapsed <= Duration::from_secs(9),
+            "a slow probe succeeds within its larger ceiling: {long_elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_config_puts_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/configs"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri(), None).unwrap();
+        client
+            .reload_config("mixed-port: 7890\nlog-level: info\n")
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(requests[0].url.path(), "/configs");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let payload = body["payload"].as_str().expect("payload is a string");
+        assert!(
+            payload.contains("mixed-port"),
+            "the yaml rides along as `payload`: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_failure_carries_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/configs"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("yaml: line 3: could not find expected ':'"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri(), None).unwrap();
+        let err = client.reload_config("bad: [").await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("400"), "status is reported: {message}");
+        assert!(
+            message.contains("could not find expected ':'"),
+            "the controller's explanation is reported: {message}"
+        );
+    }
+
+    #[test]
+    fn secret_accessor_exposes_the_controller_secret() {
+        let with_secret = Client::new("127.0.0.1:9090", Some("s3cret".into())).unwrap();
+        assert_eq!(with_secret.secret(), Some("s3cret"));
+
+        let without_secret = Client::new("127.0.0.1:9090", None).unwrap();
+        assert_eq!(without_secret.secret(), None);
+
+        // The constructor drops empty secrets; the accessor agrees.
+        let empty = Client::new("127.0.0.1:9090", Some(String::new())).unwrap();
+        assert_eq!(empty.secret(), None);
+    }
 
     #[test]
     fn parses_groups_and_hides_hidden_ones() {
