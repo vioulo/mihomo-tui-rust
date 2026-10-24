@@ -160,15 +160,16 @@ impl Store {
     }
 }
 
-/// The next free id: one past the highest numeric id still listed. A deleted
-/// profile may hand its number back — nothing references a deleted id.
+/// The next free id in `s{n}` form (`s1`, `s2`, …): one past the highest
+/// number still listed. A deleted profile may hand its number back —
+/// nothing references a deleted id.
 fn next_id(profiles: &[ProfileMeta]) -> String {
     let highest = profiles
         .iter()
-        .filter_map(|profile| profile.id.parse::<u64>().ok())
+        .filter_map(|profile| profile.id.strip_prefix('s')?.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
-    (highest + 1).to_string()
+    format!("s{}", highest + 1)
 }
 
 /// Overwrite `path` atomically: write a sibling tmp file, then rename it over
@@ -232,9 +233,9 @@ mod tests {
         )
         .unwrap();
 
-        // Ids are assigned in sequence, regardless of the names given.
-        assert_eq!(first.id, "1");
-        assert_eq!(second.id, "2");
+        // Ids are assigned in sequence as `s{n}`, regardless of the names.
+        assert_eq!(first.id, "s1");
+        assert_eq!(second.id, "s2");
 
         // Both artifacts are private to the user.
         let index_mode = fs::metadata(paths.profiles_json())
@@ -242,7 +243,7 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(index_mode & 0o777, 0o600, "profiles.json is 0600");
-        let snapshot_mode = fs::metadata(Store::snapshot_path(&paths, "2"))
+        let snapshot_mode = fs::metadata(Store::snapshot_path(&paths, "s2"))
             .unwrap()
             .permissions()
             .mode();
@@ -251,7 +252,7 @@ mod tests {
         // The index survives a reload with every field intact.
         let reloaded = Store::load_profiles(&paths).unwrap();
         assert_eq!(reloaded.len(), 2);
-        assert_eq!(reloaded[0].id, "1");
+        assert_eq!(reloaded[0].id, "s1");
         assert_eq!(reloaded[0].name, "first");
         assert_eq!(reloaded[0].url, "https://a.example/sub");
         assert_eq!(reloaded[0].created_ms, 1_000);
@@ -262,10 +263,10 @@ mod tests {
             reloaded[0].policy.is_empty(),
             "a fresh profile starts with no policy"
         );
-        assert_eq!(reloaded[1].id, "2");
+        assert_eq!(reloaded[1].id, "s2");
 
         // And the snapshot holds the exact downloaded text.
-        assert_eq!(Store::read_snapshot(&paths, "2").unwrap(), "proxies: b");
+        assert_eq!(Store::read_snapshot(&paths, "s2").unwrap(), "proxies: b");
     }
 
     #[test]
