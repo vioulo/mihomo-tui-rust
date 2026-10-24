@@ -8,7 +8,9 @@
 //! can show what an import actually brought in — node count, protocol mix,
 //! and whatever had to be skipped. Share links are parsed for VLESS, VMess,
 //! Trojan, Hysteria2 (including the `hy2://` alias) and AnyTLS, the v1
-//! converter protocol list.
+//! converter protocol list. Links with any other scheme are recorded in the
+//! report as skipped, never fatal: the link-list shape sniffs on the generic
+//! `scheme://` form, not on the supported list.
 
 use std::collections::BTreeMap;
 
@@ -116,7 +118,7 @@ fn parse_base64_links(input: &str) -> Option<ParsedSubscription> {
 }
 
 /// Raw link-list branch: one share link per line; blank lines are ignored.
-/// Returns `None` when no line carries one of our protocols, so the sniffer
+/// Returns `None` when no line carries a share-link shape, so the sniffer
 /// can try another shape instead of reporting an empty import.
 fn parse_link_lines(text: &str) -> Option<ParsedSubscription> {
     let mut mapping = Mapping::new();
@@ -129,7 +131,7 @@ fn parse_link_lines(text: &str) -> Option<ParsedSubscription> {
         if line.is_empty() {
             continue;
         }
-        if has_link_scheme(line) {
+        if looks_like_link(line) {
             saw_link = true;
         }
         match parse_link(line) {
@@ -153,17 +155,26 @@ fn parse_link_lines(text: &str) -> Option<ParsedSubscription> {
     Some(ParsedSubscription { mapping, report })
 }
 
-/// The share-link schemes this parser understands.
-const LINK_SCHEMES: [&str; 6] = ["vmess", "vless", "trojan", "hysteria2", "hy2", "anytls"];
-
-/// Whether the line starts with one of our share-link schemes.
-fn has_link_scheme(line: &str) -> bool {
-    LINK_SCHEMES.iter().any(|scheme| {
-        let Some(head) = line.get(..scheme.len()) else {
-            return false;
-        };
-        head.eq_ignore_ascii_case(scheme) && line[scheme.len()..].starts_with("://")
-    })
+/// Whether the line has the shape of *some* share link: a legal URI scheme
+/// (RFC 3986: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) followed by
+/// `://`. The link-list gate is deliberately protocol-agnostic — a list of
+/// schemes outside the supported set (`ss://` and friends) is still a list
+/// of share links and belongs in the skip report, not in a fatal error —
+/// but strictly shaped, so prose and YAML never sniff as links: the scheme
+/// must sit at the start of the line (`foo: bar` has no `://`, and
+/// `see https://…` mid-sentence fails the shape check).
+fn looks_like_link(line: &str) -> bool {
+    let Some((scheme, _)) = line.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    if !chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
 }
 
 /// Parse one share link into a mihomo proxy mapping. The error carries a
@@ -678,6 +689,39 @@ trojan://ok@8.8.8.8:443?security=tls#kept-node
             "names the missing port: {:?}",
             parsed.report.skipped
         );
+    }
+
+    #[test]
+    fn pure_unknown_scheme_list_is_ok_and_all_skipped() {
+        // A list of `ss://` lines is still a share-link list: the link-list
+        // gate is any `scheme://` shape, so this imports as Ok with every
+        // line recorded in `skipped` — never the fatal "not share links"
+        // error, and never an empty-handed Err.
+        let input = "\
+ss://YWVzLTEyODpnY21AdGVzdA@ss.example.com:443#ss-one
+ss://YWVzLTEyODpnY21AdGVzdA@ss2.example.com:443#ss-two
+";
+        let parsed = parse_subscription(input).unwrap();
+
+        assert_eq!(parsed.report.total_nodes, 0);
+        assert!(parsed.report.protocols.is_empty(), "no known protocol");
+        let proxies = proxies_of(&parsed);
+        assert!(proxies.is_empty(), "nothing parsed, proxies stay empty");
+
+        assert_eq!(
+            parsed.report.skipped.len(),
+            2,
+            "{:?}",
+            parsed.report.skipped
+        );
+        for (index, reason) in parsed.report.skipped.iter().enumerate() {
+            assert!(
+                reason.starts_with(&format!("line {}: ", index + 1))
+                    && reason.contains("unsupported scheme")
+                    && reason.contains("ss"),
+                "names the line and the scheme: {reason}"
+            );
+        }
     }
 
     #[test]
