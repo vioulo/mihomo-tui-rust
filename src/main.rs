@@ -22,6 +22,11 @@ mod store;
 // drop the escape hatch once they do.
 #[allow(dead_code)]
 mod subscription;
+// Config block model and per-block diff: unit tests pin the API, but nothing
+// consumes it until the merge stage (task 7), the confirm page (task 10) and
+// the profile worker (task 11) land — drop the escape hatch once they do.
+#[allow(dead_code)]
+mod merge;
 mod ui;
 
 use std::process::ExitCode;
