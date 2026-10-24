@@ -396,13 +396,7 @@ pub fn validate(cfg: &Mapping) -> std::result::Result<(), Vec<String>> {
         Some(Value::Sequence(groups)) => {
             for (index, group) in groups.iter().enumerate() {
                 validate_named(group, index, "proxy-groups", "group", &mut errors);
-                if let Some(group) = group.as_mapping() {
-                    let members = group.get("proxies").and_then(Value::as_sequence);
-                    let label = object_label(group, index, "proxy-groups");
-                    if members.is_none_or(|members| members.is_empty()) {
-                        errors.push(format!("{label}: group has no members"));
-                    }
-                }
+                validate_group_fields(group, index, &mut errors);
             }
         }
         // Groups are optional: rules may target bare proxies directly.
@@ -509,6 +503,27 @@ fn validate_node_fields(node: &Value, index: usize, errors: &mut Vec<String>) {
         .is_none_or(|server| server.trim().is_empty())
     {
         errors.push(format!("{label}: node has no server"));
+    }
+}
+
+/// The group-only field checks: `type` must exist, or mihomo cannot tell
+/// what kind of group this is and refuses to start; the members list must
+/// be non-empty, or the group routes nowhere.
+fn validate_group_fields(group: &Value, index: usize, errors: &mut Vec<String>) {
+    let Some(group) = group.as_mapping() else {
+        return; // already reported by validate_named
+    };
+    let label = object_label(group, index, "proxy-groups");
+    if group
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind.trim().is_empty())
+    {
+        errors.push(format!("{label}: group has no type"));
+    }
+    let members = group.get("proxies").and_then(Value::as_sequence);
+    if members.is_none_or(|members| members.is_empty()) {
+        errors.push(format!("{label}: group has no members"));
     }
 }
 
@@ -1239,6 +1254,23 @@ mod tests {
         assert!(
             errors.iter().any(|error| error.contains("LONELY")),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_group_without_type() {
+        // mihomo cannot start a group it cannot classify: name and members
+        // alone are not enough, and the error must name the group.
+        let cfg = map_yaml(
+            "proxies: [{name: ok, type: ss, server: s, port: 1}]\n\
+             proxy-groups: [{name: NOTYPED, proxies: [ok]}]\n",
+        );
+        let errors = validate(&cfg).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("NOTYPED") && error.contains("type")),
+            "group without type is an error naming the group: {errors:?}"
         );
     }
 
