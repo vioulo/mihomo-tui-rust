@@ -137,9 +137,6 @@ impl Client {
     /// `PUT /configs` with `{"payload": <yaml>}` asks a running mihomo to apply
     /// the YAML without a process restart; the external controller (and so this
     /// client's endpoint) survives the reload.
-    // Consumed by the profile worker (task 11); until then only tests call it —
-    // drop the escape hatch once they do.
-    #[allow(dead_code)]
     pub async fn reload_config(&self, yaml_payload: &str) -> Result<()> {
         Self::send(
             self.request(Method::PUT, self.url(&["configs"])?)

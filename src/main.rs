@@ -73,7 +73,6 @@ struct Options {
     /// Relocates the whole mihomo-tui state tree; resolved by `Paths`.
     config_dir: Option<String>,
     /// Overrides the concurrency stored in `config.json` for delay tests.
-    #[allow(dead_code)]
     concurrency: Option<usize>,
 }
 

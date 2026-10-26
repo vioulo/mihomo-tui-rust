@@ -463,6 +463,19 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Longest slice of an error body quoted in a failed-download message.
 const BODY_SNIPPET_CHARS: usize = 200;
 
+/// Strip the query and fragment so a token-bearing subscription URL can be
+/// quoted in errors and toasts without leaking the credential.
+fn redacted_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
 /// Download a subscription URL and return the body text.
 ///
 /// Any status outside 2xx is an error carrying the status code and the
@@ -480,7 +493,7 @@ pub async fn download(url: &str) -> Result<String> {
         .get(url)
         .send()
         .await
-        .with_context(|| format!("requesting {url}"))?;
+        .with_context(|| format!("requesting {}", redacted_url(url)))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -490,16 +503,24 @@ pub async fn download(url: &str) -> Result<String> {
         if truncated {
             snippet.push('…');
         }
+        let target = redacted_url(url);
         if snippet.is_empty() {
-            bail!("subscription server returned {status} for {url}");
+            bail!("subscription server returned {status} for {target}");
         }
-        bail!("subscription server returned {status} for {url}: {snippet}");
+        bail!("subscription server returned {status} for {target}: {snippet}");
     }
 
-    response
+    let body = response
         .text()
         .await
-        .with_context(|| format!("reading body of {url}"))
+        .with_context(|| format!("reading body of {}", redacted_url(url)))?;
+    // A subscription is a few kilobytes at most; refuse anything that would
+    // exhaust memory within the request budget.
+    const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+    if body.len() > MAX_BODY_BYTES {
+        bail!("subscription response exceeded {MAX_BODY_BYTES} bytes");
+    }
+    Ok(body)
 }
 
 /// The production import entry: parse `raw`, then hand it to the store.

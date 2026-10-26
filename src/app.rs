@@ -1016,8 +1016,9 @@ impl App {
                 if generation != self.testing_gen {
                     return None;
                 }
+                let was_testing = self.testing;
                 self.testing = false;
-                if total > 0 {
+                if was_testing && total > 0 {
                     self.set_toast(ToastKind::Info, format!("tested {ok}/{total} OK"));
                 }
                 None

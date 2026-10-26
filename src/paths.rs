@@ -52,8 +52,6 @@ impl Paths {
     }
 
     /// The TUI's own settings (see [`TuiConfig`]).
-    // Read by the TUI at startup once settings are wired (task 14).
-    #[allow(dead_code)]
     pub fn config_json(&self) -> PathBuf {
         self.root.join("config.json")
     }
@@ -114,7 +112,6 @@ impl Default for TuiConfig {
     }
 }
 
-#[allow(dead_code)]
 impl TuiConfig {
     /// Missing or corrupt file means defaults — settings are never worth
     /// blocking the TUI over.
@@ -127,6 +124,7 @@ impl TuiConfig {
 
     /// Persist settings as plain JSON with ordinary permissions; nothing
     /// secret lives here. [`Paths::ensure`] must have run first.
+    #[allow(dead_code)]
     pub fn save(&self, p: &Paths) -> Result<()> {
         let text = serde_json::to_string_pretty(self).context("serializing tui settings")?;
         fs::write(p.config_json(), text)
