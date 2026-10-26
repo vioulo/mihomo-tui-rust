@@ -480,6 +480,19 @@ async fn execute(
             ));
         }
         Command::Refresh => {}
+        // The profile worker takes these over in the next task. Until it
+        // exists they must still compile and must not pretend to have
+        // changed anything.
+        Command::SwitchProfile(_)
+        | Command::ConfirmSwitch { .. }
+        | Command::AddProfile { .. }
+        | Command::UpdateProfile(_)
+        | Command::DeleteProfile(_) => {
+            let _ = tx.send(Event::Toast(
+                ToastKind::Info,
+                "subscription actions are not wired up yet".into(),
+            ));
+        }
     }
 
     // Every action changes state, so pull a fresh snapshot right away rather

@@ -57,6 +57,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Tab::Proxies => draw_proxies(frame, app, areas[1]),
         Tab::Connections => draw_connections(frame, app, areas[1]),
         Tab::Logs => draw_logs(frame, app, areas[1]),
+        Tab::Subscriptions => draw_subscriptions(frame, app, areas[1]),
     }
 
     draw_footer(frame, app, areas[2], now);
@@ -128,6 +129,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
             ("q", "quit"),
         ],
         Tab::Logs => &[("c", "clear"), ("tab", "switch"), ("q", "quit")],
+        Tab::Subscriptions => &[
+            ("a", "add"),
+            ("u", "update"),
+            ("d", "delete"),
+            ("enter", "switch"),
+            ("[/]", "cycle"),
+            ("q", "quit"),
+        ],
     };
 
     let mut spans = Vec::new();
@@ -738,6 +747,20 @@ fn log_color(level: &str) -> Color {
         "debug" => Color::DarkGray,
         _ => Color::Gray,
     }
+}
+
+/// Interim view until the Subscriptions page gets its full layout: the state
+/// behind the tab is already live, so this only has to prove the tab renders.
+fn draw_subscriptions(frame: &mut Frame, app: &App, area: Rect) {
+    let block = panel(&format!("Subscriptions ({})", app.profiles.len()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(format!("{} imported subscriptions", app.profiles.len())),
+        Line::from("the profile worker is not wired up yet").fg(MUTED),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]
