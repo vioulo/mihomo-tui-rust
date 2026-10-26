@@ -4,10 +4,12 @@
 //! [`Command`] the caller should run against the API. Keeping the network out
 //! of this module keeps the whole thing testable without a live mihomo.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
 
 use crate::api::{Configs, Connection, Connections, Group, LogLine, Version};
@@ -130,6 +132,8 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
+    /// A mouse click. Only presses of the left button are actionable.
+    Mouse(MouseEvent),
     Tick,
     /// Periodic re-read of configs, groups and connections.
     Snapshot(Box<Snapshot>),
@@ -247,6 +251,16 @@ pub struct App {
     pub external_dirty: Option<String>,
     /// Profile id waiting for the second `d` of the two-stage delete.
     pub delete_armed: Option<String>,
+    /// Width of the rendered tab strip. Written by the header and read by
+    /// mouse hit-testing so both use exactly the same geometry.
+    pub tab_width: Cell<u16>,
+    /// Visible subscriptions table and its first visible row, captured after
+    /// a draw. A click maps back through these to a profile index.
+    pub subs_area: Cell<Rect>,
+    pub subs_top: Cell<usize>,
+    /// Same for the proxy member table.
+    pub members_area: Cell<Rect>,
+    pub members_top: Cell<usize>,
 }
 
 /// Rolling traffic counters for the overview graphs.
@@ -299,6 +313,11 @@ impl App {
             input: None,
             external_dirty: None,
             delete_armed: None,
+            tab_width: Cell::new(0),
+            subs_area: Cell::new(Rect::default()),
+            subs_top: Cell::new(0),
+            members_area: Cell::new(Rect::default()),
+            members_top: Cell::new(0),
         }
     }
 
@@ -793,10 +812,77 @@ impl App {
         }
     }
 
+    /// Handle a click. Modals are deliberately mouse-transparent for v1:
+    /// the keyboard remains the only way to drive the confirm page and the
+    /// add form, so a stray click cannot apply a config.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+
+        if mouse.row == 0 {
+            let width = match self.tab_width.get() {
+                0 => u16::MAX,
+                width => width,
+            };
+            let hit = crate::ui::tab_hitboxes(width)
+                .into_iter()
+                .find(|(range, _)| range.contains(&mouse.column))
+                .map(|(_, tab)| tab);
+            if let Some(tab) = hit {
+                self.tab = tab;
+                self.delete_armed = None;
+            }
+            return;
+        }
+
+        match self.tab {
+            Tab::Subscriptions => self.click_subscription(mouse.column, mouse.row),
+            Tab::Proxies => self.click_member(mouse.column, mouse.row),
+            _ => {}
+        }
+    }
+
+    fn click_subscription(&mut self, x: u16, y: u16) {
+        let area = self.subs_area.get();
+        if !area.contains(Position::new(x, y)) {
+            return;
+        }
+        // The table pins a header row at the top of its area; clicks there
+        // are not rows.
+        let Some(row) = (y - area.y).checked_sub(1) else {
+            return;
+        };
+        let index = self.subs_top.get() + row as usize;
+        if index < self.profiles.len() {
+            self.sub_idx = index;
+            self.delete_armed = None;
+        }
+    }
+
+    fn click_member(&mut self, x: u16, y: u16) {
+        let area = self.members_area.get();
+        if !area.contains(Position::new(x, y)) {
+            return;
+        }
+        let members = self
+            .current_group()
+            .map(|group| group.members.len())
+            .unwrap_or(0);
+        let index = self.members_top.get() + (y - area.y) as usize;
+        if index < members {
+            self.member_idx = index;
+        }
+    }
+
     /// Apply an event, returning a command when the event implies follow-up work.
     pub fn on_event(&mut self, event: Event) -> Option<Command> {
         match event {
             Event::Key(key) => self.on_key(key),
+            Event::Mouse(mouse) => {
+                self.on_mouse(mouse);
+                None
+            }
             Event::Tick => None,
             Event::Snapshot(snapshot) => {
                 self.apply_snapshot(*snapshot);
@@ -1651,5 +1737,112 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
         assert_eq!(app.on_key(key(KeyCode::Char('u'))), None);
         app.on_key(key(KeyCode::Down));
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn tab_range(tab: Tab) -> std::ops::Range<u16> {
+        crate::ui::tab_hitboxes(100)
+            .into_iter()
+            .find(|(_, candidate)| *candidate == tab)
+            .map(|(range, _)| range)
+            .expect("every tab has a hitbox")
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_pages_using_the_rendered_geometry() {
+        let mut app = app_with_groups();
+        app.tab_width.set(100);
+
+        let subscriptions = tab_range(Tab::Subscriptions);
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            subscriptions.start + 1,
+            0,
+        ));
+        assert_eq!(app.tab, Tab::Subscriptions);
+
+        let overview = tab_range(Tab::Overview);
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            overview.start + 1,
+            0,
+        ));
+        assert_eq!(app.tab, Tab::Overview);
+
+        // The right side of row 0 is the status line, not a tab.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 99, 0));
+        assert_eq!(app.tab, Tab::Overview);
+    }
+
+    #[test]
+    fn clicks_select_subscription_rows_through_the_scroll_offset() {
+        let mut app = app_with_profiles(&["s1", "s2", "s3"]);
+        app.sub_idx = 0;
+        app.subs_area.set(Rect::new(0, 1, 60, 5));
+        app.subs_top.set(1);
+
+        // Area row 0 is the pinned header; row 2 is the second data row,
+        // which is profile index 1 + 1 = 2.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 3));
+        assert_eq!(app.sub_idx, 2);
+
+        // The header and the space below the table are inert.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+        assert_eq!(app.sub_idx, 2);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 20));
+        assert_eq!(app.sub_idx, 2);
+    }
+
+    #[test]
+    fn clicks_select_proxy_members() {
+        let mut app = app_with_groups();
+        app.tab = Tab::Proxies;
+        app.group_idx = 1;
+        app.member_idx = 0;
+        app.members_area.set(Rect::new(50, 2, 40, 3));
+        app.members_top.set(0);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 3));
+        assert_eq!(app.member_idx, 1);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 2));
+        assert_eq!(app.member_idx, 0);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 8));
+        assert_eq!(app.member_idx, 0, "outside the table is ignored");
+    }
+
+    #[test]
+    fn only_left_button_presses_are_actionable() {
+        let mut app = app_with_groups();
+        app.tab_width.set(100);
+        let subscriptions = tab_range(Tab::Subscriptions).start + 1;
+
+        app.on_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            subscriptions,
+            0,
+        ));
+        assert_eq!(app.tab, Tab::Overview);
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            subscriptions,
+            0,
+        ));
+        assert_eq!(app.tab, Tab::Overview);
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            subscriptions,
+            0,
+        ));
+        assert_eq!(app.tab, Tab::Overview);
     }
 }

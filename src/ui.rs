@@ -1,19 +1,23 @@
 //! Rendering. Every function here takes `&App` and draws; nothing mutates
 //! application state or touches the network.
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Sparkline, Table,
-    TableState, Tabs,
+    Block, BorderType, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Sparkline,
+    Table, TableState, Tabs,
 };
 
 use crate::api::Connection;
-use crate::app::{App, Tab, format_bytes, format_rate, sparkline_data};
+use crate::app::{
+    App, InputField, InputOverlay, PendingSwitch, Tab, format_bytes, format_rate, sparkline_data,
+};
+use crate::merge::Source;
+use crate::store::ProfileMeta;
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
@@ -61,13 +65,45 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     }
 
     draw_footer(frame, app, areas[2], now);
+
+    // Modals are drawn last so they cover the page and its footer. Keyboard
+    // priority in `App` keeps them mutually exclusive.
+    if let Some(pending) = &app.pending {
+        draw_confirm_overlay(frame, app, pending, area);
+    }
+    if let Some(input) = &app.input {
+        draw_input_overlay(frame, input, area);
+    }
+}
+
+/// The exact string drawn for one tab. The header and the hitboxes share it,
+/// so a click can never disagree with the pixels.
+fn tab_title(index: usize, tab: Tab) -> String {
+    format!(" {} {} ", index + 1, tab.title())
+}
+
+/// Click rectangles for the tab strip. `width` is the strip's rendered width
+/// (not the terminal width), so clicks in the right-aligned status area never
+/// match a tab that was clipped away.
+pub fn tab_hitboxes(width: u16) -> Vec<(std::ops::Range<u16>, Tab)> {
+    let mut start = 0u16;
+    Tab::ALL
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tab)| {
+            let end = start + tab_title(index, *tab).chars().count() as u16;
+            let range = start..end.min(width);
+            start = end;
+            (range.start < width).then_some((range, *tab))
+        })
+        .collect()
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let titles: Vec<Line> = Tab::ALL
         .iter()
         .enumerate()
-        .map(|(i, tab)| Line::from(format!(" {} {} ", i + 1, tab.title())))
+        .map(|(i, tab)| Line::from(tab_title(i, *tab)))
         .collect();
 
     let selected = Tab::ALL.iter().position(|t| *t == app.tab);
@@ -101,19 +137,20 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let right_width = right.width() as u16;
     let areas =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
+    app.tab_width.set(areas[0].width);
     frame.render_widget(tabs, areas[0]);
     frame.render_widget(Paragraph::new(right), areas[1]);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
-    let keys: &[(&str, &str)] = match app.tab {
-        Tab::Overview => &[
+    let mut keys: Vec<(&str, &str)> = match app.tab {
+        Tab::Overview => vec![
             ("m/M", "mode"),
             ("r", "refresh"),
             ("tab", "switch"),
             ("q", "quit"),
         ],
-        Tab::Proxies => &[
+        Tab::Proxies => vec![
             ("j/k", "group"),
             ("h/l", "member"),
             ("enter", "select"),
@@ -121,15 +158,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
             ("r", "refresh"),
             ("q", "quit"),
         ],
-        Tab::Connections => &[
+        Tab::Connections => vec![
             ("j/k", "move"),
             ("x", "close"),
             ("X", "close all"),
             ("r", "refresh"),
             ("q", "quit"),
         ],
-        Tab::Logs => &[("c", "clear"), ("tab", "switch"), ("q", "quit")],
-        Tab::Subscriptions => &[
+        Tab::Logs => vec![("c", "clear"), ("tab", "switch"), ("q", "quit")],
+        Tab::Subscriptions => vec![
             ("a", "add"),
             ("u", "update"),
             ("d", "delete"),
@@ -139,11 +176,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         ],
     };
 
+    // The two-stage delete has no modal; the footer is where the second
+    // press is advertised.
+    if app.delete_armed.is_some()
+        && let Some(entry) = keys.iter_mut().find(|(key, _)| *key == "d")
+    {
+        *entry = ("d", "again = delete");
+    }
+    if app.external_dirty.is_some() {
+        keys.push(("v", "review changes"));
+    }
+
     let mut spans = Vec::new();
     for (key, label) in keys {
-        spans.push(Span::styled(*key, Style::default().fg(ACCENT)));
+        spans.push(Span::styled(key, Style::default().fg(ACCENT)));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(*label, Style::default().fg(MUTED)));
+        spans.push(Span::styled(label, Style::default().fg(MUTED)));
         spans.push(Span::raw("  "));
     }
 
@@ -374,6 +422,8 @@ fn draw_group_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
+    app.members_area.set(Rect::default());
+    app.members_top.set(0);
     let group = match app.current_group() {
         Some(group) => group,
         None => return,
@@ -472,6 +522,8 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
         areas[1],
         &mut state,
     );
+    app.members_area.set(areas[1]);
+    app.members_top.set(state.offset());
 
     let selected = group.members.get(app.member_idx);
     let detail = match selected {
@@ -752,13 +804,273 @@ fn log_color(level: &str) -> Color {
 /// Interim view until the Subscriptions page gets its full layout: the state
 /// behind the tab is already live, so this only has to prove the tab renders.
 fn draw_subscriptions(frame: &mut Frame, app: &App, area: Rect) {
+    // Reset before every early return so a click can never be interpreted
+    // against the previous frame's geometry.
+    app.subs_area.set(Rect::default());
+    app.subs_top.set(0);
+
     let block = panel(&format!("Subscriptions ({})", app.profiles.len()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if app.profiles.is_empty() {
+        frame.render_widget(
+            empty_state("no subscriptions yet — press a to add one"),
+            inner,
+        );
+        return;
+    }
+
+    let rows: Vec<Row> = app
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            let selected = index == app.sub_idx;
+            let marker = if selected { "▶ " } else { "  " };
+            let name_style = if selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Row::new(vec![
+                Cell::from(format!("{marker}{}", profile.name)).style(name_style),
+                Cell::from(profile.nodes.to_string()),
+                Cell::from(profile.protocols.clone()).style(Style::default().fg(MUTED)),
+                Cell::from(updated_label(profile.updated_ms)).style(Style::default().fg(MUTED)),
+                Cell::from(policy_label(profile)),
+            ])
+        })
+        .collect();
+
+    let header = Row::new(vec![
+        Cell::from("name"),
+        Cell::from("nodes"),
+        Cell::from("protocols"),
+        Cell::from("updated"),
+        Cell::from("policy"),
+    ])
+    .style(Style::default().fg(MUTED).bold());
+
+    let widths = [
+        Constraint::Min(16),
+        Constraint::Length(5),
+        Constraint::Length(22),
+        Constraint::Length(11),
+        Constraint::Length(9),
+    ];
+
+    let mut state = TableState::default();
+    state.select(Some(app.sub_idx));
+    frame.render_stateful_widget(
+        Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(Style::default().bg(Color::Indexed(236)))
+            .highlight_symbol("")
+            .column_spacing(1),
+        inner,
+        &mut state,
+    );
+
+    // `inner` includes the pinned header row; the click mapping subtracts it.
+    app.subs_area.set(inner);
+    app.subs_top.set(state.offset());
+}
+
+/// "just now" / "3m ago": subscriptions are refreshed by hand, so a coarse
+/// relative age is more useful than a timestamp.
+fn updated_label(updated_ms: u64) -> String {
+    if updated_ms == 0 {
+        return "-".to_string();
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(updated_ms);
+    let age_secs = now.saturating_sub(updated_ms) / 1000;
+    match age_secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", age_secs / 60),
+        3_600..=86_399 => format!("{}h ago", age_secs / 3_600),
+        _ => format!("{}d ago", age_secs / 86_400),
+    }
+}
+
+/// Compact policy marker for the subscriptions table: the remembered side
+/// when it is uniform, `mixed` when the profile remembers both.
+fn policy_label(profile: &ProfileMeta) -> String {
+    let mut base = false;
+    let mut subscription = false;
+    for value in profile.policy.values() {
+        match value.as_str() {
+            "base" => base = true,
+            "subscription" => subscription = true,
+            _ => {}
+        }
+    }
+    match (base, subscription) {
+        (true, false) => "[base]".to_string(),
+        (false, true) => "[sub]".to_string(),
+        (true, true) => "[mixed]".to_string(),
+        (false, false) => "default".to_string(),
+    }
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+fn draw_confirm_overlay(frame: &mut Frame, app: &App, pending: &PendingSwitch, area: Rect) {
+    let width = area.width.saturating_sub(4).min(94);
+    let height = (pending.diffs.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let popup = centered_rect(area, width, height);
+    frame.render_widget(Clear, popup);
+
+    let name = app
+        .profiles
+        .iter()
+        .find(|profile| profile.id == pending.profile_id)
+        .map(|profile| profile.name.clone())
+        .unwrap_or_else(|| pending.profile_id.clone());
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(
+            Line::from(format!(" Confirm switch · {name} "))
+                .style(Style::default().fg(ACCENT).bold()),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("  {:<14}", "block"),
+                Style::default().fg(MUTED).bold(),
+            ),
+            Span::styled(format!("{:<18}", "base"), Style::default().fg(MUTED).bold()),
+            Span::styled("subscription", Style::default().fg(MUTED).bold()),
+        ])),
+        rows[0],
+    );
+
+    let visible = rows[1].height as usize;
+    let offset = pending.cursor.saturating_sub(visible.saturating_sub(1));
+    let lines: Vec<Line> = pending
+        .diffs
+        .iter()
+        .enumerate()
+        .map(|(index, diff)| {
+            let chosen = pending
+                .choices
+                .get(&diff.block)
+                .copied()
+                .unwrap_or(Source::Base);
+            let cursor = index == pending.cursor;
+            let title_style = if cursor {
+                Style::default().fg(ACCENT).bold()
+            } else if diff.equal {
+                Style::default().fg(MUTED)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let base_style = if chosen == Source::Base {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            };
+            let sub_style = if chosen == Source::Subscription {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(MUTED)
+            };
+            let base_marker = if chosen == Source::Base { "●" } else { "○" };
+            let sub_marker = if chosen == Source::Subscription {
+                "●"
+            } else {
+                "○"
+            };
+            let base_text = diff.base.as_deref().unwrap_or("-");
+            let sub_text = diff.sub.as_deref().unwrap_or("-");
+
+            Line::from(vec![
+                Span::styled(if cursor { "▶ " } else { "  " }, title_style),
+                Span::styled(format!("{:<14}", diff.block.title()), title_style),
+                Span::styled(format!("{base_marker} {base_text:<16}"), base_style),
+                Span::styled(" ▸ ", Style::default().fg(MUTED)),
+                Span::styled(format!("{sub_marker} {sub_text}"), sub_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), rows[1]);
+
+    let hint = format!(
+        "↑↓ move   b/s or ←→ switch   r remember: {}   enter apply   Esc cancel",
+        if pending.remember { "on" } else { "off" }
+    );
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(MUTED)),
+        rows[2],
+    );
+}
+
+fn draw_input_overlay(frame: &mut Frame, overlay: &InputOverlay, area: Rect) {
+    let popup = centered_rect(
+        area,
+        area.width.saturating_sub(4).min(78),
+        6.min(area.height),
+    );
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Line::from(" Add subscription ").style(Style::default().fg(ACCENT).bold()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let field = |label: &str, value: &str, focused: bool| {
+        let label_style = if focused {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            Style::default().fg(MUTED)
+        };
+        let value_style = if focused {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        let mut spans = vec![
+            Span::styled(format!("{label:<6}"), label_style),
+            Span::styled(value.to_string(), value_style),
+        ];
+        if focused {
+            spans.push(Span::styled("▌", Style::default().fg(ACCENT)));
+        }
+        Line::from(spans)
+    };
+
     let lines = vec![
-        Line::from(format!("{} imported subscriptions", app.profiles.len())),
-        Line::from("a add · u update · d delete · enter switch").fg(MUTED),
+        field("URL", &overlay.url, overlay.field == InputField::Url),
+        field("Name", &overlay.name, overlay.field == InputField::Name),
+        Line::from("Tab switch field   enter add   Esc cancel").style(Style::default().fg(MUTED)),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -769,8 +1081,12 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use std::collections::BTreeMap;
+
     use crate::api::{Configs, Connections, Group, Member, Version};
-    use crate::app::App;
+    use crate::app::{App, InputField, InputOverlay, PendingSwitch};
+    use crate::merge::{Block, BlockDiff, Source};
+    use crate::store::ProfileMeta;
 
     fn app() -> App {
         let mut app = App::new(
@@ -1016,5 +1332,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn profile(id: &str, name: &str, policy: &str) -> ProfileMeta {
+        ProfileMeta {
+            id: id.to_string(),
+            name: name.to_string(),
+            url: "https://example/sub".to_string(),
+            created_ms: 1,
+            updated_ms: 0,
+            nodes: 3,
+            protocols: "vless(2), trojan(1)".to_string(),
+            policy: BTreeMap::from([("proxies".to_string(), policy.to_string())]),
+        }
+    }
+
+    #[test]
+    fn subscriptions_tab_lists_profiles_and_policy() {
+        let mut app = app();
+        app.tab = Tab::Subscriptions;
+        app.profiles = vec![
+            profile("s1", "alpha", "base"),
+            profile("s2", "beta", "base"),
+            profile("s3", "gamma", "subscription"),
+        ];
+        app.sub_idx = 1;
+
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("Subscriptions (3)"), "{screen}");
+        assert!(screen.contains("alpha"));
+        assert!(screen.contains("gamma"));
+        assert!(
+            screen.contains("▶ beta"),
+            "selected row is marked: {screen}"
+        );
+        assert!(screen.contains("vless(2), trojan(1)"), "protocols show");
+        assert!(screen.contains("[base]"), "remembered base policy shows");
+        assert!(screen.contains("[sub]"), "remembered sub policy shows");
+        assert!(screen.contains("nodes"), "column header shows");
+    }
+
+    #[test]
+    fn confirm_overlay_renders_blocks_choices_and_remember_hint() {
+        let mut app = app();
+        app.profiles = vec![profile("s1", "alpha", "base")];
+        app.pending = Some(PendingSwitch {
+            profile_id: "s1".to_string(),
+            diffs: vec![
+                BlockDiff {
+                    block: Block::Rules,
+                    base: Some("1 rule".to_string()),
+                    sub: Some("2 rules".to_string()),
+                    equal: false,
+                },
+                BlockDiff {
+                    block: Block::Dns,
+                    base: None,
+                    sub: Some("present".to_string()),
+                    equal: false,
+                },
+            ],
+            choices: BTreeMap::from([(Block::Rules, Source::Subscription)]),
+            cursor: 0,
+            remember: false,
+        });
+
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("Confirm switch · alpha"), "{screen}");
+        // The chosen side is marked on both axes: text and colour.
+        assert!(screen.contains("○ 1 rule"), "{screen}");
+        assert!(screen.contains("● 2 rules"), "{screen}");
+        assert!(screen.contains("base"), "base column header");
+        assert!(screen.contains("subscription"), "sub column header");
+        assert!(screen.contains("r remember: off"), "{screen}");
+        assert!(screen.contains("Esc cancel"), "{screen}");
+    }
+
+    #[test]
+    fn input_overlay_renders_focused_field() {
+        let mut app = app();
+        app.input = Some(InputOverlay {
+            url: "https://example/sub".to_string(),
+            name: "my sub".to_string(),
+            field: InputField::Url,
+        });
+
+        let screen = render(&app, 100, 30);
+        let url_line = screen
+            .lines()
+            .find(|line| line.contains("https://example/sub"))
+            .expect("url renders");
+        let name_line = screen
+            .lines()
+            .find(|line| line.contains("my sub"))
+            .expect("name renders");
+        assert!(
+            url_line.contains('▌'),
+            "url line has the cursor: {url_line}"
+        );
+        assert!(
+            !name_line.contains('▌'),
+            "unfocused field has no cursor: {name_line}"
+        );
+        assert!(screen.contains("Tab switch field"));
+
+        app.input.as_mut().unwrap().field = InputField::Name;
+        let screen = render(&app, 100, 30);
+        let url_line = screen
+            .lines()
+            .find(|line| line.contains("https://example/sub"))
+            .unwrap();
+        let name_line = screen.lines().find(|line| line.contains("my sub")).unwrap();
+        assert!(!url_line.contains('▌'));
+        assert!(name_line.contains('▌'), "focus moved: {name_line}");
+    }
+
+    #[test]
+    fn tab_hitboxes_match_drawn_titles() {
+        let app = app();
+        let screen = render(&app, 100, 30);
+        let first_line = screen.lines().next().expect("a header row");
+        let hitboxes = tab_hitboxes(100);
+        assert_eq!(hitboxes.len(), Tab::ALL.len());
+
+        for (index, (range, tab)) in hitboxes.into_iter().enumerate() {
+            let drawn: String = first_line
+                .chars()
+                .skip(range.start as usize)
+                .take((range.end - range.start) as usize)
+                .collect();
+            assert_eq!(
+                drawn,
+                format!(" {} {} ", index + 1, tab.title()),
+                "hitbox {range:?} for {tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_and_update_and_delete_hints_render() {
+        let mut app = app();
+        app.tab = Tab::Subscriptions;
+        app.profiles = vec![profile("s1", "alpha", "base")];
+
+        let screen = render(&app, 100, 30);
+        for hint in ["a add", "u update", "d delete", "enter switch", "[/] cycle"] {
+            assert!(screen.contains(hint), "missing {hint}: {screen}");
+        }
+
+        app.delete_armed = Some("s1".to_string());
+        let screen = render(&app, 100, 30);
+        assert!(
+            screen.contains("again = delete"),
+            "the second press is advertised: {screen}"
+        );
     }
 }

@@ -17,16 +17,19 @@ mod ui;
 mod watcher;
 mod worker;
 
+use std::io::stdout;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
 use tokio::sync::mpsc;
 
 use api::Client;
 use app::{App, Command, Event, Snapshot, ToastKind};
-use paths::Paths;
+use paths::{Paths, TuiConfig};
 use watcher::spawn_config_watcher;
 use worker::spawn_profile_worker;
 
@@ -49,7 +52,7 @@ OPTIONS:
     -h, --help           Print this help
 
 KEYS:
-    1-4 / tab            switch tab        q / ctrl-c   quit
+    1-5 / tab            switch tab        q / ctrl-c   quit
     j/k, h/l             move              enter        select proxy
     t / T                test member/group r            refresh
     m / M                cycle mode        x / X        close connection(s)
@@ -143,10 +146,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Options>>
 }
 
 /// Restores the terminal however we leave the loop — normal exit or panic.
-struct TerminalGuard;
+struct TerminalGuard {
+    mouse: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.mouse {
+            let _ = execute!(stdout(), DisableMouseCapture);
+        }
         let _ = ratatui::try_restore();
     }
 }
@@ -189,11 +197,19 @@ async fn run(options: Options) -> Result<()> {
     // leave the terminal in raw mode.
     let paths = Paths::resolve(options.config_dir.as_deref())?;
     paths.ensure()?;
+    // Mouse capture is a convenience, not a requirement: a broken or
+    // unreadable config.json falls back to the defaults.
+    let tui_config = TuiConfig::load(&paths);
 
     let client = Arc::new(Client::new(&options.endpoint, options.secret.clone())?);
 
     let mut terminal = ratatui::try_init()?;
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard {
+        mouse: tui_config.mouse,
+    };
+    if tui_config.mouse {
+        execute!(stdout(), EnableMouseCapture)?;
+    }
 
     let mut app = App::new(
         // Show the normalised endpoint the client actually dials, so a bare
@@ -283,6 +299,11 @@ fn spawn_key_reader(tx: mpsc::UnboundedSender<Event>) {
                     }
                     if tx.send(Event::Key(key)).is_err() {
                         break; // the UI loop is gone
+                    }
+                }
+                Ok(crossterm::event::Event::Mouse(mouse)) => {
+                    if tx.send(Event::Mouse(mouse)).is_err() {
+                        break;
                     }
                 }
                 Ok(_) => continue,
