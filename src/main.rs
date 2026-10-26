@@ -13,6 +13,8 @@ mod paths;
 mod runtime;
 mod store;
 mod subscription;
+#[cfg(test)]
+mod test_pool;
 mod ui;
 mod watcher;
 mod worker;
@@ -20,12 +22,14 @@ mod worker;
 use std::io::stdout;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use api::Client;
 use app::{App, Command, Event, Snapshot, ToastKind};
@@ -200,6 +204,8 @@ async fn run(options: Options) -> Result<()> {
     // Mouse capture is a convenience, not a requirement: a broken or
     // unreadable config.json falls back to the defaults.
     let tui_config = TuiConfig::load(&paths);
+    let concurrency = options.concurrency.unwrap_or(tui_config.concurrency);
+    let concurrency = if concurrency == 0 { 8 } else { concurrency }.max(1);
 
     let client = Arc::new(Client::new(&options.endpoint, options.secret.clone())?);
 
@@ -222,6 +228,7 @@ async fn run(options: Options) -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
     let (profile_tx, profile_rx) = mpsc::unbounded_channel::<Command>();
+    let (test_tx, test_rx) = mpsc::unbounded_channel::<Command>();
 
     spawn_key_reader(tx.clone());
     spawn_ticker(tx.clone());
@@ -229,6 +236,7 @@ async fn run(options: Options) -> Result<()> {
     spawn_streams(client.clone(), tx.clone(), &options);
     spawn_profile_worker(client.clone(), paths.clone(), profile_rx, tx.clone());
     spawn_config_watcher(paths.clone(), tx.clone());
+    spawn_test_pool(client.clone(), concurrency, test_rx, tx.clone());
 
     // The Subscriptions page is useful before the first command: seed it
     // with whatever was imported in an earlier run.
@@ -257,6 +265,8 @@ async fn run(options: Options) -> Result<()> {
             if let Some(command) = app.on_event(event) {
                 if is_profile_command(&command) {
                     let _ = profile_tx.send(command);
+                } else if matches!(command, Command::TestMany { .. } | Command::CancelTests(_)) {
+                    let _ = test_tx.send(command);
                 } else {
                     spawn_command(command, client.clone(), tx.clone());
                 }
@@ -499,14 +509,8 @@ async fn execute(
                 result: result.map_err(|err| short_reason(&err)),
             });
         }
-        Command::TestGroup {
-            name,
-            url,
-            timeout_ms,
-        } => {
-            let delays = client.group_delay(&name, &url, timeout_ms).await?;
-            let _ = tx.send(Event::GroupDelay(delays));
-        }
+        // Test commands are routed to the test pool, not executed here.
+        Command::TestMany { .. } | Command::CancelTests(_) => {}
         Command::CloseConnection(id) => {
             client.close_connection(&id).await?;
             let _ = tx.send(Event::Toast(ToastKind::Success, "connection closed".into()));
@@ -550,6 +554,137 @@ fn short_reason(err: &anyhow::Error) -> String {
         .last()
         .map(|cause| cause.to_string())
         .unwrap_or_else(|| err.to_string())
+}
+
+/// Bounded-concurrency delay testing. Each generation gets its own
+/// cancellation flag so a late result from an older run cannot overwrite a
+/// newer one, and `CancelTests` can stop dispatch without waiting for the
+/// in-flight requests to finish.
+type GenerationFlags = Arc<Mutex<Vec<(u64, Arc<AtomicBool>)>>>;
+
+fn spawn_test_pool(
+    client: Arc<Client>,
+    concurrency: usize,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    events: mpsc::UnboundedSender<Event>,
+) {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let generations: GenerationFlags = Arc::new(Mutex::new(Vec::new()));
+
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            match command {
+                Command::TestMany {
+                    generation,
+                    names,
+                    url,
+                    timeout_ms,
+                } => {
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    generations
+                        .lock()
+                        .unwrap()
+                        .push((generation, cancelled.clone()));
+                    let client = client.clone();
+                    let semaphore = semaphore.clone();
+                    let events = events.clone();
+                    let generations = generations.clone();
+                    tokio::spawn(async move {
+                        run_test_generation(
+                            client,
+                            semaphore,
+                            generation,
+                            names,
+                            url,
+                            timeout_ms,
+                            events.clone(),
+                            cancelled.clone(),
+                        )
+                        .await;
+                        generations
+                            .lock()
+                            .unwrap()
+                            .retain(|(g, _)| *g != generation);
+                    });
+                }
+                Command::CancelTests(generation) => {
+                    let guard = generations.lock().unwrap();
+                    if let Some((_, flag)) = guard.iter().find(|(g, _)| *g == generation) {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_test_generation(
+    client: Arc<Client>,
+    semaphore: Arc<Semaphore>,
+    generation: u64,
+    names: Vec<String>,
+    url: String,
+    timeout_ms: u64,
+    events: mpsc::UnboundedSender<Event>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let ok = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for name in names {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let client = client.clone();
+        let url = url.clone();
+        let events = events.clone();
+        let cancelled = cancelled.clone();
+        let ok = ok.clone();
+        let done = done.clone();
+        let name = name.clone();
+        handles.push(tokio::spawn(async move {
+            if cancelled.load(Ordering::Relaxed) {
+                drop(permit);
+                return;
+            }
+            let result = client.proxy_delay(&name, &url, timeout_ms).await;
+            let mapped = match result {
+                Ok(delay) => {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                    Ok(delay)
+                }
+                Err(err) => Err(short_reason(&err)),
+            };
+            if !cancelled.load(Ordering::Relaxed) {
+                done.fetch_add(1, Ordering::Relaxed);
+                let _ = events.send(Event::TestProgress {
+                    generation,
+                    name: name.clone(),
+                    result: mapped,
+                });
+            }
+            drop(permit);
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    let final_ok = ok.load(Ordering::Relaxed);
+    let final_done = done.load(Ordering::Relaxed);
+    let _ = events.send(Event::TestsFinished {
+        generation,
+        ok: final_ok,
+        total: final_done,
+    });
 }
 
 #[cfg(test)]

@@ -154,7 +154,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
             ("j/k", "group"),
             ("h/l", "member"),
             ("enter", "select"),
-            ("t/T", "test"),
+            ("t/T/A", "test"),
+            ("s", "sort"),
             ("r", "refresh"),
             ("q", "quit"),
         ],
@@ -429,7 +430,11 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
         None => return,
     };
 
-    let busy = if app.testing { " · testing…" } else { "" };
+    let busy = if app.testing {
+        format!(" · testing ({}/{})", app.testing_done, app.testing_total)
+    } else {
+        String::new()
+    };
     let title = format!(
         "{} · {} ({}){busy}",
         group.name,
@@ -466,10 +471,20 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
     ]);
     frame.render_widget(Paragraph::new(header), areas[0]);
 
-    let rows: Vec<Row> = group
-        .members
+    // `sort_by_delay` is view-only: the underlying member order never
+    // changes, so proxy selection and delay application stay stable.
+    let mut order: Vec<usize> = (0..group.members.len()).collect();
+    if app.sort_by_delay {
+        order.sort_by_key(|&index| {
+            let delay = group.members[index].delay;
+            (delay.is_none(), delay.unwrap_or(u64::MAX), index)
+        });
+    }
+
+    let rows: Vec<Row> = order
         .iter()
-        .map(|member| {
+        .map(|&index| {
+            let member = &group.members[index];
             let current = member.name == group.now;
             let name_style = if current {
                 Style::default().fg(ACCENT).bold()
@@ -513,7 +528,11 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut state = TableState::default();
-    state.select(Some(app.member_idx));
+    let selected_position = order
+        .iter()
+        .position(|&index| index == app.member_idx)
+        .unwrap_or(0);
+    state.select(Some(selected_position));
     frame.render_stateful_widget(
         Table::new(rows, widths)
             .row_highlight_style(Style::default().bg(Color::Indexed(236)))
@@ -524,6 +543,7 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
     );
     app.members_area.set(areas[1]);
     app.members_top.set(state.offset());
+    *app.members_display_order.borrow_mut() = order;
 
     let selected = group.members.get(app.member_idx);
     let detail = match selected {

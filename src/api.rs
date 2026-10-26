@@ -222,24 +222,6 @@ impl Client {
         Ok(body.delay)
     }
 
-    /// Test every member of a group at once. Returns `name -> delay`, where a
-    /// delay of 0 means the member failed.
-    pub async fn group_delay(
-        &self,
-        group: &str,
-        url: &str,
-        timeout_ms: u64,
-    ) -> Result<HashMap<String, u64>> {
-        let mut endpoint = self.url(&["group", group, "delay"])?;
-        endpoint
-            .query_pairs_mut()
-            .append_pair("timeout", &timeout_ms.to_string())
-            .append_pair("url", url);
-
-        let resp = Self::send(self.request(Method::GET, endpoint)).await?;
-        resp.json().await.context("decoding group delay result")
-    }
-
     pub async fn connections(&self) -> Result<Connections> {
         let resp = Self::send(self.request(Method::GET, self.url(&["connections"])?)).await?;
         resp.json().await.context("decoding /connections")

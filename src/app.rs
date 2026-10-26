@@ -5,7 +5,7 @@
 //! of this module keeps the whole thing testable without a live mihomo.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -100,11 +100,15 @@ pub enum Command {
         url: String,
         timeout_ms: u64,
     },
-    TestGroup {
-        name: String,
+    /// Run many delay tests with bounded concurrency.
+    TestMany {
+        generation: u64,
+        names: Vec<String>,
         url: String,
         timeout_ms: u64,
     },
+    /// Cancel an in-flight `TestMany` generation.
+    CancelTests(u64),
     CloseConnection(String),
     CloseAllConnections,
     Refresh,
@@ -147,8 +151,18 @@ pub enum Event {
         name: String,
         result: Result<u64, String>,
     },
-    /// A whole group's delay test finished.
-    GroupDelay(HashMap<String, u64>),
+    /// One member's delay test finished (carries its generation).
+    TestProgress {
+        generation: u64,
+        name: String,
+        result: Result<u64, String>,
+    },
+    /// All members of a generation finished (or were cancelled).
+    TestsFinished {
+        generation: u64,
+        ok: usize,
+        total: usize,
+    },
     Toast(ToastKind, String),
     /// The controller connection failed; stop hammering it.
     Fatal(String),
@@ -238,6 +252,17 @@ pub struct App {
     pub offline: Option<String>,
     /// True while a group-wide delay test is running.
     pub testing: bool,
+    /// Generation counter for the concurrent test pool; stale results are
+    /// dropped by comparing against this.
+    pub testing_gen: u64,
+    pub testing_total: usize,
+    pub testing_done: usize,
+    pub testing_ok: usize,
+    /// View-only reordering of the member list by measured delay.
+    pub sort_by_delay: bool,
+    /// Displayed member row -> original member index, captured by the
+    /// renderer so mouse clicks land on the right node when sorted.
+    pub members_display_order: std::cell::RefCell<Vec<usize>>,
     /// Imported subscriptions, in display order.
     pub profiles: Vec<ProfileMeta>,
     /// Highlighted row on the Subscriptions page; also the profile that
@@ -307,6 +332,12 @@ impl App {
             timeout_ms,
             offline: None,
             testing: false,
+            testing_gen: 0,
+            testing_total: 0,
+            testing_done: 0,
+            testing_ok: 0,
+            sort_by_delay: false,
+            members_display_order: std::cell::RefCell::new(Vec::new()),
             profiles: Vec::new(),
             sub_idx: 0,
             pending: None,
@@ -398,19 +429,9 @@ impl App {
         self.log.push_back(line);
     }
 
-    pub fn apply_group_delays(&mut self, delays: &HashMap<String, u64>) {
-        for group in &mut self.groups {
-            for member in &mut group.members {
-                if let Some(delay) = delays.get(&member.name) {
-                    // The group endpoint reports 0 for members that failed.
-                    member.delay = (*delay > 0).then_some(*delay);
-                }
-            }
-        }
-    }
-
     pub fn apply_member_delay(&mut self, name: &str, result: &Result<u64, String>) {
-        let delay = result.as_ref().ok().copied();
+        // The controller reports 0 for members that failed to test.
+        let delay = result.as_ref().ok().copied().filter(|value| *value > 0);
         for group in &mut self.groups {
             for member in &mut group.members {
                 if member.name == name {
@@ -469,6 +490,10 @@ impl App {
                 return None;
             }
             KeyCode::Esc => {
+                if self.testing {
+                    self.testing = false;
+                    return Some(Command::CancelTests(self.testing_gen));
+                }
                 // With no modal open, Esc only disarms the delete prompt.
                 self.delete_armed = None;
                 return None;
@@ -504,6 +529,20 @@ impl App {
         let current = self.sub_idx.min(len - 1) as isize;
         let next = (current + delta).rem_euclid(len as isize) as usize;
         Some(self.profiles[next].id.clone())
+    }
+
+    /// Every member name across every group, in first-seen order and
+    /// deduplicated — the `A` tier of concurrent testing.
+    fn all_member_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for group in &self.groups {
+            for member in &group.members {
+                if !names.iter().any(|existing| existing == &member.name) {
+                    names.push(member.name.clone());
+                }
+            }
+        }
+        names
     }
 
     /// The highlighted profile, if any.
@@ -610,18 +649,61 @@ impl App {
             }
             KeyCode::Char('T') => {
                 let group = self.current_group()?;
-                let name = group.name.clone();
+                let names: Vec<String> = {
+                    let mut out = Vec::new();
+                    for member in &group.members {
+                        if !out.iter().any(|existing| existing == &member.name) {
+                            out.push(member.name.clone());
+                        }
+                    }
+                    out
+                };
+                if names.is_empty() {
+                    return None;
+                }
                 let url = group
                     .test_url
                     .clone()
                     .unwrap_or_else(|| self.delay_url.clone());
                 let timeout_ms = self.timeout_ms;
                 self.testing = true;
-                Some(Command::TestGroup {
-                    name,
+                self.testing_gen = self.testing_gen.wrapping_add(1);
+                self.testing_total = names.len();
+                self.testing_done = 0;
+                self.testing_ok = 0;
+                Some(Command::TestMany {
+                    generation: self.testing_gen,
+                    names,
                     url,
                     timeout_ms,
                 })
+            }
+            KeyCode::Char('A') => {
+                let names = self.all_member_names();
+                if names.is_empty() {
+                    return None;
+                }
+                let url = self
+                    .current_group()?
+                    .test_url
+                    .clone()
+                    .unwrap_or_else(|| self.delay_url.clone());
+                let timeout_ms = self.timeout_ms;
+                self.testing = true;
+                self.testing_gen = self.testing_gen.wrapping_add(1);
+                self.testing_total = names.len();
+                self.testing_done = 0;
+                self.testing_ok = 0;
+                Some(Command::TestMany {
+                    generation: self.testing_gen,
+                    names,
+                    url,
+                    timeout_ms,
+                })
+            }
+            KeyCode::Char('s') => {
+                self.sort_by_delay = !self.sort_by_delay;
+                None
             }
             _ => None,
         }
@@ -869,9 +951,11 @@ impl App {
             .current_group()
             .map(|group| group.members.len())
             .unwrap_or(0);
-        let index = self.members_top.get() + (y - area.y) as usize;
-        if index < members {
-            self.member_idx = index;
+        let displayed = self.members_top.get() + (y - area.y) as usize;
+        if displayed < members {
+            let order = self.members_display_order.borrow();
+            let original = order.get(displayed).copied().unwrap_or(displayed);
+            self.member_idx = original;
         }
     }
 
@@ -909,12 +993,33 @@ impl App {
                 self.apply_member_delay(&name, &result);
                 None
             }
-            Event::GroupDelay(delays) => {
-                let ok = delays.values().filter(|d| **d > 0).count();
-                let total = delays.len();
-                self.apply_group_delays(&delays);
+            Event::TestProgress {
+                generation,
+                name,
+                result,
+            } => {
+                if generation != self.testing_gen || !self.testing {
+                    return None;
+                }
+                self.testing_done = self.testing_done.saturating_add(1).min(self.testing_total);
+                if result.is_ok() {
+                    self.testing_ok = self.testing_ok.saturating_add(1);
+                }
+                self.apply_member_delay(&name, &result);
+                None
+            }
+            Event::TestsFinished {
+                generation,
+                ok,
+                total,
+            } => {
+                if generation != self.testing_gen {
+                    return None;
+                }
                 self.testing = false;
-                self.set_toast(ToastKind::Info, format!("tested {ok}/{total} OK"));
+                if total > 0 {
+                    self.set_toast(ToastKind::Info, format!("tested {ok}/{total} OK"));
+                }
                 None
             }
             Event::Toast(kind, text) => {
@@ -1151,8 +1256,9 @@ mod tests {
         let all = app.on_key(key(KeyCode::Char('T')));
         assert_eq!(
             all,
-            Some(Command::TestGroup {
-                name: "auto".into(),
+            Some(Command::TestMany {
+                generation: 1,
+                names: vec!["node-a".into(), "node-b".into()],
                 url: "http://gstatic/204".into(),
                 timeout_ms: 5000,
             })
@@ -1277,22 +1383,36 @@ mod tests {
     }
 
     #[test]
-    fn group_delay_results_update_members_and_retire_the_testing_flag() {
+    fn progress_events_update_members_and_retire_the_testing_flag() {
         let mut app = app_with_groups();
         app.testing = true;
+        app.testing_gen = 1;
+        app.testing_total = 2;
         app.tab = Tab::Proxies;
 
-        let mut delays = HashMap::new();
-        delays.insert("node-a".to_string(), 42);
-        delays.insert("node-b".to_string(), 0); // 0 means the test failed
-
-        app.on_event(Event::GroupDelay(delays));
+        app.on_event(Event::TestProgress {
+            generation: 1,
+            name: "node-a".into(),
+            result: Ok(42),
+        });
+        app.on_event(Event::TestProgress {
+            generation: 1,
+            name: "node-b".into(),
+            result: Ok(0),
+        });
 
         assert_eq!(app.groups[1].members[0].delay, Some(42));
         assert_eq!(
             app.groups[1].members[1].delay, None,
             "zero delay is not a real measurement"
         );
+        assert_eq!(app.testing_done, 2);
+
+        app.on_event(Event::TestsFinished {
+            generation: 1,
+            ok: 1,
+            total: 2,
+        });
         assert!(!app.testing);
         assert!(app.active_toast(Instant::now()).is_some());
     }
@@ -1844,5 +1964,79 @@ mod tests {
             0,
         ));
         assert_eq!(app.tab, Tab::Overview);
+    }
+    #[test]
+    fn a_key_starts_test_many_with_deduped_names_and_generation() {
+        let mut app = App::new("http://127.0.0.1:9090".into(), "http://x/204".into(), 5000);
+        app.groups = vec![
+            group("GLOBAL", &["shared", "auto"], None),
+            group("auto", &["node-a", "shared"], Some("http://gstatic/204")),
+        ];
+        app.tab = Tab::Proxies;
+        app.group_idx = 1;
+
+        let command = app.on_key(key(KeyCode::Char('A')));
+        assert_eq!(
+            command,
+            Some(Command::TestMany {
+                generation: 1,
+                names: vec!["shared".into(), "auto".into(), "node-a".into()],
+                url: "http://gstatic/204".into(),
+                timeout_ms: 5000,
+            })
+        );
+        assert!(app.testing);
+        assert_eq!(app.testing_total, 3);
+    }
+
+    #[test]
+    fn progress_events_update_counters_and_stale_gen_is_ignored() {
+        let mut app = app_with_groups();
+        app.testing = true;
+        app.testing_gen = 1;
+        app.testing_total = 2;
+        app.testing_done = 0;
+        app.testing_ok = 0;
+        app.tab = Tab::Proxies;
+
+        app.on_event(Event::TestProgress {
+            generation: 1,
+            name: "node-a".into(),
+            result: Ok(42),
+        });
+        assert_eq!(app.testing_done, 1);
+        assert_eq!(app.testing_ok, 1);
+        assert_eq!(app.groups[1].members[0].delay, Some(42));
+
+        app.on_event(Event::TestProgress {
+            generation: 0,
+            name: "node-b".into(),
+            result: Ok(7),
+        });
+        assert_eq!(app.testing_done, 1);
+        assert_eq!(app.groups[1].members[1].delay, None);
+
+        app.on_event(Event::TestsFinished {
+            generation: 1,
+            ok: 1,
+            total: 1,
+        });
+        assert!(!app.testing);
+    }
+
+    #[test]
+    fn esc_cancels_and_s_toggles_sort() {
+        let mut app = app_with_groups();
+        app.tab = Tab::Proxies;
+        app.testing = true;
+        app.testing_gen = 3;
+
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Command::CancelTests(3)));
+        assert!(!app.testing);
+
+        assert_eq!(app.on_key(key(KeyCode::Char('s'))), None);
+        assert!(app.sort_by_delay);
+        assert_eq!(app.on_key(key(KeyCode::Char('s'))), None);
+        assert!(!app.sort_by_delay);
     }
 }
