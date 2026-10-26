@@ -50,7 +50,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     let areas = Layout::vertical([
         Constraint::Length(1), // tabs
         Constraint::Min(3),    // body
-        Constraint::Length(1), // footer
+        Constraint::Length(2), // footer (hints + status)
     ])
     .split(area);
 
@@ -114,32 +114,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .padding("", "");
 
     // The endpoint is more useful than a title here, so show it right-aligned.
-    let host = app.endpoint.trim_end_matches('/');
-    let status = if app.offline.is_some() {
-        "offline"
-    } else {
-        "connected"
-    };
-    let status_color = if app.offline.is_some() {
-        Color::Red
-    } else {
-        Color::Green
-    };
-
-    let right = Line::from(vec![
-        Span::styled(status, Style::default().fg(status_color)),
-        Span::raw("  "),
-        Span::styled(host, Style::default().fg(MUTED)),
-        Span::raw(" "),
-    ]);
-
-    // Lay the tabs and the status text out on the same row without overlap.
-    let right_width = right.width() as u16;
-    let areas =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
-    app.tab_width.set(areas[0].width);
-    frame.render_widget(tabs, areas[0]);
-    frame.render_widget(Paragraph::new(right), areas[1]);
+    // The tab strip gets the whole row so all five tabs stay visible even on
+    // an 80-column terminal; the controller status moved to the footer.
+    app.tab_width.set(area.width);
+    frame.render_widget(tabs, area);
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
@@ -196,17 +174,41 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         spans.push(Span::raw("  "));
     }
 
-    // A toast takes over the right-hand side until it expires.
+    let footer_areas = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+
+    // A toast takes over the hint line until it expires.
     if let Some(toast) = app.active_toast(now) {
         let text = Line::from(format!(" {} ", toast.text))
             .style(Style::default().fg(toast.color()).bold());
-        let width = (text.width() as u16).min(area.width / 2);
-        let areas = Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).split(area);
+        let width = (text.width() as u16).min(footer_areas[0].width / 2);
+        let areas = Layout::horizontal([Constraint::Min(0), Constraint::Length(width)])
+            .split(footer_areas[0]);
         frame.render_widget(Paragraph::new(Line::from(spans)), areas[0]);
         frame.render_widget(Paragraph::new(text).alignment(Alignment::Right), areas[1]);
     } else {
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(Line::from(spans)), footer_areas[0]);
     }
+
+    // Controller status + endpoint on the second footer line.
+    let status = if app.offline.is_some() {
+        "offline"
+    } else {
+        "connected"
+    };
+    let status_color = if app.offline.is_some() {
+        Color::Red
+    } else {
+        Color::Green
+    };
+    let host = app.endpoint.trim_end_matches('/');
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(status, Style::default().fg(status_color)),
+            Span::raw("  "),
+            Span::styled(host, Style::default().fg(MUTED)),
+        ])),
+        footer_areas[1],
+    );
 }
 
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
