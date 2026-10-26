@@ -160,8 +160,6 @@ pub enum Event {
     /// The profile list changed: add, update, delete or a finished switch.
     ProfilesUpdated(Vec<ProfileMeta>),
     /// A config file changed on disk. Never applied automatically.
-    // Constructed by the external-change watcher (task 12).
-    #[allow(dead_code)]
     ExternalChange {
         path: String,
     },

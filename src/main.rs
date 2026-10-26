@@ -14,6 +14,7 @@ mod runtime;
 mod store;
 mod subscription;
 mod ui;
+mod watcher;
 mod worker;
 
 use std::process::ExitCode;
@@ -26,6 +27,7 @@ use tokio::sync::mpsc;
 use api::Client;
 use app::{App, Command, Event, Snapshot, ToastKind};
 use paths::Paths;
+use watcher::spawn_config_watcher;
 use worker::spawn_profile_worker;
 
 const USAGE: &str = "\
@@ -210,6 +212,7 @@ async fn run(options: Options) -> Result<()> {
     spawn_refresh(client.clone(), tx.clone(), options.refresh_ms);
     spawn_streams(client.clone(), tx.clone(), &options);
     spawn_profile_worker(client.clone(), paths.clone(), profile_rx, tx.clone());
+    spawn_config_watcher(paths.clone(), tx.clone());
 
     // The Subscriptions page is useful before the first command: seed it
     // with whatever was imported in an earlier run.
