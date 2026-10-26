@@ -9,7 +9,7 @@ agent, no config changes beyond the controller block.
 
 ## Features
 
-Four tabs, switchable with `1`–`4` or `tab`:
+Five tabs, switchable with `1`–`5` or `tab`:
 
 | Tab | What it shows |
 | --- | --- |
@@ -17,6 +17,7 @@ Four tabs, switchable with `1`–`4` or `tab`:
 | **Proxies** | Every selector-ish group and its members, each with measured delay and a latency bar; select a member, test one member or the whole group |
 | **Connections** | Live connection table (destination, type, proxy chain, process, up/down, matched rule) with a detail pane; close one or all |
 | **Logs** | The live `/logs` stream, colour-coded by level |
+| **Subscriptions** | Import/update/delete subscriptions; per-block diff and merge of the base config with hot reload, remembered policy, concurrent testing |
 
 The UI is a single-threaded render loop; all network I/O happens on background
 tasks behind a pair of channels, so nothing blocks on a slow controller. The
@@ -54,6 +55,8 @@ OPTIONS:
     --timeout <MS>       Per-test timeout in ms      [default: 5000]
     --refresh <MS>       State refresh interval in ms [default: 2000]
     --log-level <LEVEL>  Log stream level: debug|info|warning|error [default: info]
+    --config-dir <DIR>   State directory (profiles, base/runtime configs, TUI settings) [default: ~/.config/mihomo-tui]
+    --concurrency <N>    Concurrent delay tests [default: 8]
     -h, --help           Print this help
 ```
 
@@ -76,7 +79,12 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 | `j` / `k` | Move down / up in a list |
 | `h` / `l` | Move between members *(Proxies)* |
 | `enter` / `space` | Select the highlighted member *(Proxies)* |
-| `t` / `T` | Test the highlighted member / the whole group *(Proxies)* |
+| `t` / `T` / `A` | Test the highlighted member / the whole group / every node of the current subscription, deduplicated *(Proxies)* |
+| `s` | Sort members by measured delay *(Proxies)* |
+| `[` / `]` | Cycle to the previous / next subscription *(global)* |
+| `v` | Re-apply the current subscription, absorbing external edits *(global)* |
+| `a` / `u` / `d` / `enter` | Add / update / delete / switch subscription *(Subscriptions)* |
+| mouse | Click tabs, proxy members, subscription rows (disable in config.json) |
 | `x` / `X` | Close the highlighted connection / all connections *(Connections)* |
 | `c` | Clear the log buffer *(Logs)* |
 
@@ -84,6 +92,36 @@ Latency tests use the group's own `url` when it defines one, falling back to
 `--delay-url`. The terminal needs to be at least 48×12; below that the app shows
 a hint instead of drawing a mangled layout.
 
+## Subscriptions and configuration
+
+The TUI keeps its own `base.yaml`. Imported subscriptions are snapshotted under
+`~/.config/mihomo-tui/subscriptions/<id>.yaml`. Switching a subscription diffs
+the base and the snapshot block by block (proxies, proxy-groups, rules, dns, …);
+conflicts are resolved per block, each subscription remembers its last choice as
+a prefill, and an identical config switches without prompting. On confirm the
+TUI renders `runtime.yaml` (atomic write, mode 0600) and hot-loads it into the
+controller, rolling back automatically on failure.
+
+External edits to `base.yaml` or a snapshot are never applied silently: the TUI
+enters a pending state and `v` shows the diff before reloading. `runtime.yaml`
+carries `external-controller` and `secret`, so a system service can point at it
+and keep its endpoint across reloads; note that this writes the secret to disk
+once more, under mode 0600.
+
+Watching is a 1-second poll of `(mtime, size)` — no extra dependency.
+
+### State directory
+
+```
+~/.config/mihomo-tui/
+  config.json        # TUI settings (concurrency, mouse)
+  base.yaml          # your base config
+  runtime.yaml       # generated config handed to mihomo (0600)
+  profiles.json      # subscription index and remembered policy (0600)
+  subscriptions/     # one snapshot per subscription (0600)
+```
+
+## Development
 ## Development
 
 ```sh
