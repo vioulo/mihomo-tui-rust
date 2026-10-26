@@ -49,13 +49,12 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     }
 
     let areas = Layout::vertical([
-        Constraint::Length(1), // tabs
+        Constraint::Length(1), // tabs + hints
         Constraint::Min(3),    // body
-        Constraint::Length(1), // footer (hints)
     ])
     .split(area);
 
-    draw_header(frame, app, areas[0]);
+    draw_header(frame, app, areas[0], now);
 
     frame.render_widget(Clear, areas[1]);
 
@@ -66,8 +65,6 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
         Tab::Logs => draw_logs(frame, app, areas[1]),
         Tab::Subscriptions => draw_subscriptions(frame, app, areas[1]),
     }
-
-    draw_footer(frame, app, areas[2], now);
 
     // Modals are drawn last so they cover the page and its footer. Keyboard
     // priority in `App` keeps them mutually exclusive.
@@ -105,7 +102,7 @@ pub fn tab_hitboxes(width: u16) -> Vec<(std::ops::Range<u16>, Tab)> {
         .collect()
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_header(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
     let titles: Vec<Line> = Tab::ALL
         .iter()
         .enumerate()
@@ -119,15 +116,60 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .divider("")
         .padding("", "");
 
-    // The endpoint is more useful than a title here, so show it right-aligned.
-    // The tab strip gets the whole row so all five tabs stay visible even on
-    // an 80-column terminal; the controller status moved to the footer.
-    app.tab_width.set(area.width);
-    frame.render_widget(tabs, area);
+    let tabs_len: u16 = Tab::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| tab_title(i, *tab).chars().count() as u16)
+        .sum();
+
+    if area.width <= tabs_len {
+        app.tab_width.set(area.width);
+        frame.render_widget(tabs, area);
+        return;
+    }
+
+    let header_areas =
+        Layout::horizontal([Constraint::Length(tabs_len), Constraint::Min(0)]).split(area);
+    app.tab_width.set(header_areas[0].width);
+    frame.render_widget(tabs, header_areas[0]);
+
+    // Right-hand side of tab bar: active toast or operation hints.
+    if let Some(toast) = app.active_toast(now) {
+        let text = Line::from(format!(" {} ", toast.text))
+            .style(Style::default().fg(toast.color()).bold());
+        frame.render_widget(
+            Paragraph::new(text).alignment(Alignment::Right),
+            header_areas[1],
+        );
+        return;
+    }
+
+    let keys = action_hints(app);
+    let right_width = header_areas[1].width as usize;
+
+    let mut spans = Vec::new();
+    let mut used_len = 1;
+    for (key, label) in keys {
+        let item_len = key.chars().count() + 1 + label.chars().count() + 2;
+        if spans.is_empty() || used_len + item_len <= right_width {
+            spans.push(Span::styled(key, Style::default().fg(ACCENT)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(label, Style::default().fg(MUTED)));
+            spans.push(Span::raw("  "));
+            used_len += item_len;
+        } else {
+            break;
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
+        header_areas[1],
+    );
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
-    let mut keys: Vec<(&str, &str)> = match app.tab {
+fn action_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut keys: Vec<(&'static str, &'static str)> = match app.tab {
         Tab::Overview => vec![
             ("m/M", "mode"),
             ("u", "tun"),
@@ -164,7 +206,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         ],
     };
 
-    // The two-stage delete has no modal; the footer is where the second
+    // The two-stage delete has no modal; the hint area is where the second
     // press is advertised.
     if app.delete_armed.is_some()
         && let Some(entry) = keys.iter_mut().find(|(key, _)| *key == "d")
@@ -175,25 +217,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         keys.push(("v", "review changes"));
     }
 
-    let mut spans = Vec::new();
-    for (key, label) in keys {
-        spans.push(Span::styled(key, Style::default().fg(ACCENT)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(label, Style::default().fg(MUTED)));
-        spans.push(Span::raw("  "));
-    }
-
-    // A toast takes over the hint line until it expires.
-    if let Some(toast) = app.active_toast(now) {
-        let text = Line::from(format!(" {} ", toast.text))
-            .style(Style::default().fg(toast.color()).bold());
-        let width = (text.width() as u16).min(area.width / 2);
-        let areas = Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).split(area);
-        frame.render_widget(Paragraph::new(Line::from(spans)), areas[0]);
-        frame.render_widget(Paragraph::new(text).alignment(Alignment::Right), areas[1]);
-    } else {
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
+    keys
 }
 
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
@@ -1374,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn a_toast_is_rendered_in_the_footer() {
+    fn a_toast_is_rendered_in_the_header() {
         let mut app = app();
         app.set_toast(crate::app::ToastKind::Success, "mode set to global");
         let screen = render(&app, 120, 30);
@@ -1384,9 +1408,10 @@ mod tests {
     #[test]
     fn an_expired_toast_is_not_rendered() {
         let app = app();
-        // No toast set at all: the footer shows only keybindings.
-        let screen = render(&app, 120, 30);
+        // No toast set at all: the header shows keybindings.
+        let screen = render(&app, 140, 30);
         assert!(screen.contains("quit"));
+        assert!(screen.contains("mode"));
     }
 
     #[test]
@@ -1575,13 +1600,13 @@ mod tests {
         app.tab = Tab::Subscriptions;
         app.profiles = vec![profile("s1", "alpha", "base")];
 
-        let screen = render(&app, 100, 30);
+        let screen = render(&app, 120, 30);
         for hint in ["a add", "u update", "d delete", "enter switch", "[/] cycle"] {
             assert!(screen.contains(hint), "missing {hint}: {screen}");
         }
 
         app.delete_armed = Some("s1".to_string());
-        let screen = render(&app, 100, 30);
+        let screen = render(&app, 120, 30);
         assert!(
             screen.contains("again = delete"),
             "the second press is advertised: {screen}"
