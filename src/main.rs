@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use tokio::sync::{Semaphore, mpsc};
@@ -159,6 +160,7 @@ impl Drop for TerminalGuard {
         if self.mouse {
             let _ = execute!(stdout(), DisableMouseCapture);
         }
+        let _ = execute!(stdout(), Show);
         let _ = ratatui::try_restore();
     }
 }
@@ -213,6 +215,7 @@ async fn run(options: Options) -> Result<()> {
     let _guard = TerminalGuard {
         mouse: tui_config.mouse,
     };
+    execute!(stdout(), Hide)?;
     if tui_config.mouse {
         execute!(stdout(), EnableMouseCapture)?;
     }
@@ -254,6 +257,8 @@ async fn run(options: Options) -> Result<()> {
 
     terminal.draw(|frame| ui::draw(frame, &app, Instant::now()))?;
 
+    let mut last_tab = app.tab;
+
     while let Some(first) = rx.recv().await {
         // Coalesce whatever else has arrived so a burst of events costs one redraw.
         let mut events = vec![first];
@@ -271,6 +276,11 @@ async fn run(options: Options) -> Result<()> {
                     spawn_command(command, client.clone(), tx.clone());
                 }
             }
+        }
+
+        if app.tab != last_tab {
+            terminal.clear()?;
+            last_tab = app.tab;
         }
 
         terminal.draw(|frame| ui::draw(frame, &app, Instant::now()))?;

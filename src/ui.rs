@@ -51,11 +51,13 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     let areas = Layout::vertical([
         Constraint::Length(1), // tabs
         Constraint::Min(3),    // body
-        Constraint::Length(2), // footer (hints + status)
+        Constraint::Length(1), // footer (hints)
     ])
     .split(area);
 
     draw_header(frame, app, areas[0]);
+
+    frame.render_widget(Clear, areas[1]);
 
     match app.tab {
         Tab::Overview => draw_overview(frame, app, areas[1]),
@@ -181,45 +183,23 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
         spans.push(Span::raw("  "));
     }
 
-    let footer_areas = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-
     // A toast takes over the hint line until it expires.
     if let Some(toast) = app.active_toast(now) {
         let text = Line::from(format!(" {} ", toast.text))
             .style(Style::default().fg(toast.color()).bold());
-        let width = (text.width() as u16).min(footer_areas[0].width / 2);
-        let areas = Layout::horizontal([Constraint::Min(0), Constraint::Length(width)])
-            .split(footer_areas[0]);
+        let width = (text.width() as u16).min(area.width / 2);
+        let areas = Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).split(area);
         frame.render_widget(Paragraph::new(Line::from(spans)), areas[0]);
         frame.render_widget(Paragraph::new(text).alignment(Alignment::Right), areas[1]);
     } else {
-        frame.render_widget(Paragraph::new(Line::from(spans)), footer_areas[0]);
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
-
-    // Controller status + endpoint on the second footer line.
-    let status = if app.offline.is_some() {
-        "offline"
-    } else {
-        "connected"
-    };
-    let status_color = if app.offline.is_some() {
-        Color::Red
-    } else {
-        Color::Green
-    };
-    let host = app.endpoint.trim_end_matches('/');
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(status, Style::default().fg(status_color)),
-            Span::raw("  "),
-            Span::styled(host, Style::default().fg(MUTED)),
-        ])),
-        footer_areas[1],
-    );
 }
 
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
-    let areas = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).split(area);
+    let status_height = if app.offline.is_some() { 8 } else { 7 };
+    let areas =
+        Layout::vertical([Constraint::Length(status_height), Constraint::Min(0)]).split(area);
     draw_status(frame, app, areas[0]);
     draw_traffic(frame, app, areas[1]);
 }
@@ -233,7 +213,25 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let (mode, mode_color) = mode_badge(app.mode());
     let configs = app.configs.as_ref();
 
-    let rows: [(Line, Line); 4] = [
+    let (status_text, status_color) = if app.offline.is_some() {
+        ("offline", Color::Red)
+    } else {
+        ("connected", Color::Green)
+    };
+    let host = app.endpoint.trim_end_matches('/');
+
+    let rows: [(Line, Line); 5] = [
+        (
+            label_line("Endpoint"),
+            Line::from(vec![
+                Span::styled(host.to_string(), Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled(
+                    format!("● {status_text}"),
+                    Style::default().fg(status_color),
+                ),
+            ]),
+        ),
         (
             label_line("Version"),
             Line::from(app.version_line()).fg(Color::White),
@@ -387,7 +385,10 @@ fn traffic_gauge(label: &str, value: u64, peak: u64, color: Color) -> Gauge<'_> 
 
 fn draw_proxies(frame: &mut Frame, app: &App, area: Rect) {
     if app.groups.is_empty() {
-        frame.render_widget(empty_state("no proxy groups"), area);
+        let block = panel("Groups");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(empty_state("no proxy groups"), inner);
         return;
     }
 
@@ -586,7 +587,10 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_connections(frame: &mut Frame, app: &App, area: Rect) {
     let connections = &app.connections.connections;
     if connections.is_empty() {
-        frame.render_widget(empty_state("no active connections"), area);
+        let block = panel("Connections");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(empty_state("no active connections"), inner);
         return;
     }
 
@@ -744,7 +748,6 @@ fn panel(title: &str) -> Block<'static> {
 
 fn empty_state(message: &str) -> Paragraph<'static> {
     Paragraph::new(Line::from(message.to_string()).fg(MUTED))
-        .block(panel(" "))
         .alignment(Alignment::Center)
         .style(Style::default().fg(MUTED))
 }
@@ -1246,6 +1249,10 @@ mod tests {
         assert!(screen.contains("RULE"), "mode badge is shown");
         assert!(screen.contains("mixed 7890"), "inbound ports are shown");
         assert!(screen.contains("connected"), "controller status is shown");
+        assert!(
+            screen.contains("http://127.0.0.1:9090"),
+            "controller endpoint is shown: {screen}"
+        );
     }
 
     #[test]
@@ -1597,5 +1604,35 @@ mod tests {
         assert!(screen.contains("Mixed Port"));
         assert!(screen.contains("7890"));
         assert!(screen.contains("[● ON ]"));
+    }
+
+    #[test]
+    fn switching_tabs_clears_the_body_area() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        app.tab = Tab::Overview;
+        terminal
+            .draw(|frame| draw(frame, &app, Instant::now()))
+            .unwrap();
+
+        app.tab = Tab::Subscriptions;
+        terminal
+            .draw(|frame| draw(frame, &app, Instant::now()))
+            .unwrap();
+
+        let screen = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Subscriptions (0)"));
+        assert!(screen.contains("no subscriptions yet"));
+        assert!(!screen.contains("Version"));
+        assert!(!screen.contains("Traffic"));
     }
 }
