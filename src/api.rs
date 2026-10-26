@@ -122,14 +122,23 @@ impl Client {
         resp.json().await.context("decoding /configs")
     }
 
-    pub async fn set_mode(&self, mode: &str) -> Result<()> {
+    pub async fn patch_configs(&self, patch: &serde_json::Value) -> Result<()> {
         let url = self.url(&["configs"])?;
-        Self::send(
-            self.request(Method::PATCH, url)
-                .json(&json!({ "mode": mode })),
-        )
-        .await?;
+        Self::send(self.request(Method::PATCH, url).json(patch)).await?;
         Ok(())
+    }
+
+    pub async fn set_mode(&self, mode: &str) -> Result<()> {
+        self.patch_configs(&json!({ "mode": mode })).await
+    }
+
+    pub async fn set_allow_lan(&self, allow: bool) -> Result<()> {
+        self.patch_configs(&json!({ "allow-lan": allow })).await
+    }
+
+    pub async fn set_tun(&self, enable: bool) -> Result<()> {
+        self.patch_configs(&json!({ "tun": { "enable": enable } }))
+            .await
     }
 
     /// Hot-reload the controller with a full config, supplied inline.
@@ -799,5 +808,26 @@ mod tests {
 
         let empty = Configs::default();
         assert_eq!(empty.ports(), "no inbound");
+    }
+
+    #[tokio::test]
+    async fn patch_configs_updates_lan_and_tun() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/configs"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(&server.uri(), None).unwrap();
+        client.set_allow_lan(true).await.unwrap();
+        client.set_tun(true).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let body1: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body1["allow-lan"], true);
+        let body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(body2["tun"]["enable"], true);
     }
 }

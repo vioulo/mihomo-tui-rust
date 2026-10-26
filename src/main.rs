@@ -60,6 +60,7 @@ KEYS:
     j/k, h/l             move              enter        select proxy
     t / T                test member/group r            refresh
     m / M                cycle mode        x / X        close connection(s)
+    u / l                toggle tun / lan  o            options
 ";
 
 #[derive(Debug, Clone)]
@@ -489,6 +490,37 @@ async fn execute(
         Command::SetMode(mode) => {
             client.set_mode(&mode).await?;
             let _ = tx.send(Event::Toast(ToastKind::Success, format!("mode → {mode}")));
+        }
+        Command::SetAllowLan(allow) => {
+            client.set_allow_lan(allow).await?;
+            let state = if allow { "on" } else { "off" };
+            let _ = tx.send(Event::Toast(
+                ToastKind::Success,
+                format!("allow-lan → {state}"),
+            ));
+        }
+        Command::SetTun(enable) => {
+            client.set_tun(enable).await?;
+            let state = if enable { "on" } else { "off" };
+            let _ = tx.send(Event::Toast(ToastKind::Success, format!("tun → {state}")));
+        }
+        Command::ApplySettings {
+            mode,
+            mixed_port,
+            allow_lan,
+            tun,
+        } => {
+            let patch = serde_json::json!({
+                "mode": mode,
+                "mixed-port": mixed_port,
+                "allow-lan": allow_lan,
+                "tun": { "enable": tun },
+            });
+            client.patch_configs(&patch).await?;
+            let _ = tx.send(Event::Toast(
+                ToastKind::Success,
+                format!("settings applied (port: {mixed_port}, mode: {mode})"),
+            ));
         }
         Command::Select { group, member } => {
             client.select(&group, &member).await?;

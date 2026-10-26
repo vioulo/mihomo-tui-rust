@@ -14,7 +14,8 @@ use ratatui::widgets::{
 
 use crate::api::Connection;
 use crate::app::{
-    App, InputField, InputOverlay, PendingSwitch, Tab, format_bytes, format_rate, sparkline_data,
+    App, InputField, InputOverlay, PendingSwitch, SettingsOverlay, Tab, format_bytes, format_rate,
+    sparkline_data,
 };
 use crate::merge::Source;
 use crate::store::ProfileMeta;
@@ -74,6 +75,9 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     if let Some(input) = &app.input {
         draw_input_overlay(frame, input, area);
     }
+    if let Some(settings) = &app.settings {
+        draw_settings_overlay(frame, settings, area);
+    }
 }
 
 /// The exact string drawn for one tab. The header and the hitboxes share it,
@@ -124,6 +128,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
     let mut keys: Vec<(&str, &str)> = match app.tab {
         Tab::Overview => vec![
             ("m/M", "mode"),
+            ("u", "tun"),
+            ("l", "lan"),
+            ("o", "options"),
             ("r", "refresh"),
             ("tab", "switch"),
             ("q", "quit"),
@@ -1097,6 +1104,70 @@ fn draw_input_overlay(frame: &mut Frame, overlay: &InputOverlay, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_settings_overlay(frame: &mut Frame, settings: &SettingsOverlay, area: Rect) {
+    let popup = centered_rect(
+        area,
+        area.width.saturating_sub(4).min(56),
+        8.min(area.height),
+    );
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Line::from(" Settings / Options ").style(Style::default().fg(ACCENT).bold()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let row = |index: usize, label: &str, value: &str| {
+        let focused = index == settings.cursor;
+        let prefix = if focused { "▶ " } else { "  " };
+        let title_style = if focused {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let value_style = if focused {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(MUTED)
+        };
+        Line::from(vec![
+            Span::styled(prefix, title_style),
+            Span::styled(format!("{label:<14}"), title_style),
+            Span::styled(value.to_string(), value_style),
+        ])
+    };
+
+    let mode_val = format!("◄ {} ►", settings.mode);
+    let port_val = if settings.cursor == 1 {
+        format!("{}▌", settings.mixed_port)
+    } else {
+        settings.mixed_port.clone()
+    };
+    let lan_val = if settings.allow_lan {
+        "[● ON ]"
+    } else {
+        "[○ OFF]"
+    };
+    let tun_val = if settings.tun {
+        "[● ON ]"
+    } else {
+        "[○ OFF]"
+    };
+
+    let lines = vec![
+        row(0, "Mode", &mode_val),
+        row(1, "Mixed Port", &port_val),
+        row(2, "Allow LAN", lan_val),
+        row(3, "TUN Mode", tun_val),
+        Line::from(""),
+        Line::from("↑↓ move  Space toggle  enter apply  Esc cancel")
+            .style(Style::default().fg(MUTED)),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,7 +1177,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::api::{Configs, Connections, Group, Member, Version};
-    use crate::app::{App, InputField, InputOverlay, PendingSwitch};
+    use crate::app::{App, InputField, InputOverlay, PendingSwitch, SettingsOverlay};
     use crate::merge::{Block, BlockDiff, Source};
     use crate::store::ProfileMeta;
 
@@ -1508,5 +1579,23 @@ mod tests {
             screen.contains("again = delete"),
             "the second press is advertised: {screen}"
         );
+    }
+
+    #[test]
+    fn settings_overlay_renders() {
+        let mut app = app();
+        app.settings = Some(SettingsOverlay {
+            mode: "rule".into(),
+            mixed_port: "7890".into(),
+            allow_lan: true,
+            tun: false,
+            cursor: 1,
+        });
+
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("Settings / Options"));
+        assert!(screen.contains("Mixed Port"));
+        assert!(screen.contains("7890"));
+        assert!(screen.contains("[● ON ]"));
     }
 }

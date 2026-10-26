@@ -91,6 +91,14 @@ impl Toast {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     SetMode(String),
+    SetAllowLan(bool),
+    SetTun(bool),
+    ApplySettings {
+        mode: String,
+        mixed_port: u16,
+        allow_lan: bool,
+        tun: bool,
+    },
     Select {
         group: String,
         member: String,
@@ -232,6 +240,15 @@ pub struct PendingSwitch {
     pub remember: bool,
 }
 
+/// The quick settings / options overlay floating over the page.
+pub struct SettingsOverlay {
+    pub mode: String,
+    pub mixed_port: String,
+    pub allow_lan: bool,
+    pub tun: bool,
+    pub cursor: usize,
+}
+
 pub struct App {
     pub tab: Tab,
     pub should_quit: bool,
@@ -272,6 +289,8 @@ pub struct App {
     pub pending: Option<PendingSwitch>,
     /// Open add-subscription form.
     pub input: Option<InputOverlay>,
+    /// Open quick settings / options form.
+    pub settings: Option<SettingsOverlay>,
     /// Path of the config file changed externally, awaiting re-apply.
     pub external_dirty: Option<String>,
     /// Profile id waiting for the second `d` of the two-stage delete.
@@ -342,6 +361,7 @@ impl App {
             sub_idx: 0,
             pending: None,
             input: None,
+            settings: None,
             external_dirty: None,
             delete_armed: None,
             tab_width: Cell::new(0),
@@ -461,6 +481,9 @@ impl App {
             return None;
         }
 
+        if self.settings.is_some() {
+            return self.on_key_settings(key);
+        }
         if self.input.is_some() {
             return self.on_key_input(key);
         }
@@ -472,6 +495,23 @@ impl App {
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
+                return None;
+            }
+            KeyCode::Char('o') => {
+                let configs = self.configs.as_ref();
+                let port = configs.map(|c| c.mixed_port).unwrap_or(7890);
+                let port_str = if port == 0 {
+                    "7890".to_string()
+                } else {
+                    port.to_string()
+                };
+                self.settings = Some(SettingsOverlay {
+                    mode: self.mode().to_string(),
+                    mixed_port: port_str,
+                    allow_lan: configs.map(|c| c.allow_lan).unwrap_or(false),
+                    tun: configs.map(|c| c.tun.enable).unwrap_or(false),
+                    cursor: 0,
+                });
                 return None;
             }
             KeyCode::Tab => {
@@ -569,6 +609,20 @@ impl App {
                 let mode = self.prev_mode().to_string();
                 self.set_mode_local(&mode);
                 Some(Command::SetMode(mode))
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                let next = !self.configs.as_ref().map(|c| c.allow_lan).unwrap_or(false);
+                if let Some(configs) = self.configs.as_mut() {
+                    configs.allow_lan = next;
+                }
+                Some(Command::SetAllowLan(next))
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                let next = !self.configs.as_ref().map(|c| c.tun.enable).unwrap_or(false);
+                if let Some(configs) = self.configs.as_mut() {
+                    configs.tun.enable = next;
+                }
+                Some(Command::SetTun(next))
             }
             _ => None,
         }
@@ -889,6 +943,93 @@ impl App {
                     }
                 }
                 None
+            }
+            _ => None,
+        }
+    }
+
+    /// Keys on the settings / options form. Every key is consumed here.
+    fn on_key_settings(&mut self, key: KeyEvent) -> Option<Command> {
+        let settings = self.settings.as_mut()?;
+        match key.code {
+            KeyCode::Esc => {
+                self.settings = None;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if settings.cursor > 0 {
+                    settings.cursor -= 1;
+                }
+                None
+            }
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                if settings.cursor < 3 {
+                    settings.cursor += 1;
+                } else if key.code == KeyCode::Tab {
+                    settings.cursor = 0;
+                }
+                None
+            }
+            KeyCode::BackTab => {
+                if settings.cursor > 0 {
+                    settings.cursor -= 1;
+                } else {
+                    settings.cursor = 3;
+                }
+                None
+            }
+            KeyCode::Char(' ')
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => {
+                match settings.cursor {
+                    0 => {
+                        let current = settings.mode.as_str();
+                        let next = match current {
+                            "rule" => "global",
+                            "global" => "direct",
+                            _ => "rule",
+                        };
+                        settings.mode = next.to_string();
+                    }
+                    2 => {
+                        settings.allow_lan = !settings.allow_lan;
+                    }
+                    3 => {
+                        settings.tun = !settings.tun;
+                    }
+                    _ => {}
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                if settings.cursor == 1 {
+                    settings.mixed_port.pop();
+                }
+                None
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if settings.cursor == 1 && settings.mixed_port.len() < 5 {
+                    settings.mixed_port.push(c);
+                }
+                None
+            }
+            KeyCode::Enter => {
+                let settings = self.settings.take().unwrap();
+                let port: u16 = settings.mixed_port.parse().unwrap_or(7890);
+                if let Some(configs) = self.configs.as_mut() {
+                    configs.mixed_port = port;
+                    configs.allow_lan = settings.allow_lan;
+                    configs.tun.enable = settings.tun;
+                    configs.mode = settings.mode.clone();
+                }
+                Some(Command::ApplySettings {
+                    mode: settings.mode,
+                    mixed_port: port,
+                    allow_lan: settings.allow_lan,
+                    tun: settings.tun,
+                })
             }
             _ => None,
         }
@@ -1309,6 +1450,41 @@ mod tests {
     }
 
     #[test]
+    fn overview_keys_toggle_tun_and_lan() {
+        let mut app = app_with_groups();
+        app.tab = Tab::Overview;
+        app.configs = Some(Configs {
+            allow_lan: false,
+            tun: crate::api::Tun { enable: false },
+            ..Default::default()
+        });
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('l'))),
+            Some(Command::SetAllowLan(true))
+        );
+        assert!(app.configs.as_ref().unwrap().allow_lan);
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('l'))),
+            Some(Command::SetAllowLan(false))
+        );
+        assert!(!app.configs.as_ref().unwrap().allow_lan);
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('u'))),
+            Some(Command::SetTun(true))
+        );
+        assert!(app.configs.as_ref().unwrap().tun.enable);
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('u'))),
+            Some(Command::SetTun(false))
+        );
+        assert!(!app.configs.as_ref().unwrap().tun.enable);
+    }
+
+    #[test]
     fn key_handling_survives_an_empty_group_list() {
         let mut app = App::new("http://127.0.0.1:9090".into(), "http://x/204".into(), 5000);
         app.tab = Tab::Proxies;
@@ -1702,6 +1878,71 @@ mod tests {
         assert!(app.input.is_some());
         assert_eq!(app.on_key(key(KeyCode::Esc)), None);
         assert!(app.input.is_none(), "esc discards the form");
+    }
+
+    #[test]
+    fn settings_overlay_edits_fields_and_applies() {
+        let mut app = app_with_groups();
+        app.configs = Some(Configs {
+            mixed_port: 7890,
+            allow_lan: false,
+            tun: crate::api::Tun { enable: false },
+            mode: "rule".into(),
+            ..Default::default()
+        });
+
+        // 'o' opens the settings overlay.
+        app.on_key(key(KeyCode::Char('o')));
+        assert!(app.settings.is_some());
+        let s = app.settings.as_ref().unwrap();
+        assert_eq!(s.cursor, 0);
+        assert_eq!(s.mode, "rule");
+        assert_eq!(s.mixed_port, "7890");
+        assert!(!s.allow_lan);
+        assert!(!s.tun);
+
+        // Toggle mode with Space.
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.settings.as_ref().unwrap().mode, "global");
+
+        // Move to mixed-port.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.settings.as_ref().unwrap().mixed_port, "7891");
+
+        // Move to allow-lan and toggle with Space.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 2);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.settings.as_ref().unwrap().allow_lan);
+
+        // Move to tun and toggle with Space.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 3);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.settings.as_ref().unwrap().tun);
+
+        // Enter applies.
+        let cmd = app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            cmd,
+            Some(Command::ApplySettings {
+                mode: "global".into(),
+                mixed_port: 7891,
+                allow_lan: true,
+                tun: true,
+            })
+        );
+        assert!(app.settings.is_none(), "Enter closes settings overlay");
+
+        // Verify local configs reflect the changes.
+        let cfg = app.configs.as_ref().unwrap();
+        assert_eq!(cfg.mixed_port, 7891);
+        assert!(cfg.allow_lan);
+        assert!(cfg.tun.enable);
+        assert_eq!(cfg.mode, "global");
     }
 
     #[test]
