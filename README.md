@@ -112,6 +112,7 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 | `q` / `ctrl-c` | 退出 |
 | `r` | 立即刷新 |
 | `m` / `M` | 向后 / 向前切换路由模式 *(Overview)* |
+| `u` / `l` | 切换 TUN 模式 / 允许局域网连接 *(Overview)* |
 | `j` / `k` | 在列表里下移 / 上移 |
 | `h` / `l` | 在成员间移动 *(Proxies)* |
 | `enter` / `空格` | 选中高亮的成员 *(Proxies)* |
@@ -119,6 +120,7 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 | `s` | 按延迟排序成员 *(Proxies)* |
 | `[` / `]` | 循环切换上一个 / 下一个订阅 *(全局)* |
 | `v` | 重新应用当前订阅（吸收外部编辑）*(全局)* |
+| `o` | 呼出快捷配置面板（修改端口、TUN、局域网、模式）*(全局)* |
 | `a` / `u` / `d` / `enter` | 添加 / 更新 / 删除 / 切换订阅 *(Subscriptions)* |
 | 鼠标 | 点击标签页、代理成员、订阅行（可在 config.json 关闭） |
 | `x` / `X` | 关闭高亮连接 / 全部连接 *(Connections)* |
@@ -129,6 +131,8 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 ## 订阅与配置
 
 TUI 维护自己的 `base.yaml`，导入的订阅快照缓存在 `~/.config/mihomo-tui/subscriptions/<id>.yaml`。切换订阅时按配置块（proxies / proxy-groups / rules / dns / …）diff，冲突逐块确认；每个订阅记住上次的 base/订阅选择作为下次预选，无差异时直接切换。确认后生成 `runtime.yaml`（原子写入、0600）并热加载到控制器，失败自动回滚。
+
+在 `base.yaml` 中支持定义 `prepend-rules`（置顶规则）与 `append-rules`（兜底规则），合并配置时置顶规则会自动插入在规则列表最前面优先匹配，保证自建分流与直连策略始终生效。
 
 外部修改 `base.yaml` 或订阅快照不会被静默应用：TUI 进入待确认状态，按 `v` 查看 diff 后再重载。`runtime.yaml` 含 `external-controller` 与 `secret`，可以把系统服务指向它持久化；注意它落盘了一份凭据，权限 0600。
 

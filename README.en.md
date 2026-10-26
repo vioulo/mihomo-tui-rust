@@ -76,6 +76,7 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 | `q` / `ctrl-c` | Quit |
 | `r` | Refresh now |
 | `m` / `M` | Cycle routing mode forward / back *(Overview)* |
+| `u` / `l` | Toggle TUN mode / Allow LAN *(Overview)* |
 | `j` / `k` | Move down / up in a list |
 | `h` / `l` | Move between members *(Proxies)* |
 | `enter` / `space` | Select the highlighted member *(Proxies)* |
@@ -83,6 +84,7 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 | `s` | Sort members by measured delay *(Proxies)* |
 | `[` / `]` | Cycle to the previous / next subscription *(global)* |
 | `v` | Re-apply the current subscription, absorbing external edits *(global)* |
+| `o` | Open quick settings / options popup (port, TUN, LAN, mode) *(global)* |
 | `a` / `u` / `d` / `enter` | Add / update / delete / switch subscription *(Subscriptions)* |
 | mouse | Click tabs, proxy members, subscription rows (disable in config.json) |
 | `x` / `X` | Close the highlighted connection / all connections *(Connections)* |
@@ -101,6 +103,8 @@ conflicts are resolved per block, each subscription remembers its last choice as
 a prefill, and an identical config switches without prompting. On confirm the
 TUI renders `runtime.yaml` (atomic write, mode 0600) and hot-loads it into the
 controller, rolling back automatically on failure.
+
+`base.yaml` also supports `prepend-rules` (top-priority custom rules) and `append-rules` (fallback rules); prepend rules are placed at the very front of the rules list to ensure custom routing takes precedence even when using subscription rules.
 
 External edits to `base.yaml` or a snapshot are never applied silently: the TUI
 enters a pending state and `v` shows the diff before reloading. `runtime.yaml`
