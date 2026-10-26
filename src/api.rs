@@ -62,9 +62,6 @@ impl Client {
 
     /// The controller secret, for rendering a runtime config whose
     /// `external-controller` + `secret` match the instance we are talking to.
-    // Consumed by the profile worker (task 11) when it renders and reloads;
-    // until then only tests call it — drop the escape hatch once they do.
-    #[allow(dead_code)]
     pub fn secret(&self) -> Option<&str> {
         self.secret.as_deref()
     }

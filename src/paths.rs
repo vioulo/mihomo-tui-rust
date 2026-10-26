@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Where mihomo-tui keeps its state, and the files inside it.
+#[derive(Clone, Debug)]
 pub struct Paths {
     pub root: PathBuf,
 }
@@ -51,6 +52,8 @@ impl Paths {
     }
 
     /// The TUI's own settings (see [`TuiConfig`]).
+    // Read by the TUI at startup once settings are wired (task 14).
+    #[allow(dead_code)]
     pub fn config_json(&self) -> PathBuf {
         self.root.join("config.json")
     }
@@ -92,6 +95,9 @@ fn default_root() -> Result<PathBuf> {
 /// TUI-only settings, stored in `config.json`. A file written by another
 /// version may lack fields; `serde(default)` fills those in rather than
 /// discarding what is there.
+// Settings are persisted and read back by the TUI once they are wired
+// (task 14: concurrency; mouse follows with the UI work).
+#[allow(dead_code)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiConfig {
@@ -108,6 +114,7 @@ impl Default for TuiConfig {
     }
 }
 
+#[allow(dead_code)]
 impl TuiConfig {
     /// Missing or corrupt file means defaults — settings are never worth
     /// blocking the TUI over.

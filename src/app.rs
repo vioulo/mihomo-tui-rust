@@ -150,9 +150,6 @@ pub enum Event {
     Fatal(String),
     /// The worker compared the base config with a subscription and needs a
     /// decision before anything is applied.
-    // Only the tests construct these four events until the profile worker
-    // lands; the worker drops this attribute with its first emission.
-    #[allow(dead_code)]
     DiffProposal {
         profile_id: String,
         diffs: Vec<BlockDiff>,
@@ -161,15 +158,14 @@ pub enum Event {
         policy: BTreeMap<String, String>,
     },
     /// The profile list changed: add, update, delete or a finished switch.
-    #[allow(dead_code)]
     ProfilesUpdated(Vec<ProfileMeta>),
     /// A config file changed on disk. Never applied automatically.
+    // Constructed by the external-change watcher (task 12).
     #[allow(dead_code)]
     ExternalChange {
         path: String,
     },
     /// Outcome of applying a merged config through the controller.
-    #[allow(dead_code)]
     ReloadResult {
         ok: bool,
         rolled_back: bool,

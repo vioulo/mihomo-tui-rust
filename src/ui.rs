@@ -758,7 +758,7 @@ fn draw_subscriptions(frame: &mut Frame, app: &App, area: Rect) {
 
     let lines = vec![
         Line::from(format!("{} imported subscriptions", app.profiles.len())),
-        Line::from("the profile worker is not wired up yet").fg(MUTED),
+        Line::from("a add · u update · d delete · enter switch").fg(MUTED),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }

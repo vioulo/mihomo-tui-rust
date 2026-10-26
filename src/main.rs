@@ -7,38 +7,14 @@
 
 mod api;
 mod app;
-// Atomic file replacement shared by the persistence layers: unit tests pin
-// the behavior, but nothing consumes it until the profile worker (task 11)
-// wires the write path — drop the escape hatch once they do.
-#[allow(dead_code)]
 mod atomic;
-// Foundation for the subscription feature: unit tests pin the API below, but
-// no production code consumes it until the profile worker and the test pool
-// land — drop the escape hatch once they do.
-#[allow(dead_code)]
-mod paths;
-// Subscription persistence: unit tests pin the API, but nothing consumes it
-// until the import flow (task 5) and the profile worker (task 11) land —
-// drop the escape hatch once they do.
-#[allow(dead_code)]
-mod store;
-// Subscription format sniffing: unit tests pin the API, but nothing consumes
-// it until the import flow (task 5) and the merge worker (task 7) land —
-// drop the escape hatch once they do.
-#[allow(dead_code)]
-mod subscription;
-// Config block model, per-block diff and the merge engine: unit tests pin the
-// API, but nothing consumes it until the runtime renderer (task 8), the
-// confirm page (task 10) and the profile worker (task 11) land — drop the
-// escape hatch once they do.
-#[allow(dead_code)]
 mod merge;
-// Runtime config rendering: unit tests pin the API, but nothing consumes it
-// until the confirm page (task 10) and the profile worker (task 11) land —
-// drop the escape hatch once they do.
-#[allow(dead_code)]
+mod paths;
 mod runtime;
+mod store;
+mod subscription;
 mod ui;
+mod worker;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -49,6 +25,8 @@ use tokio::sync::mpsc;
 
 use api::Client;
 use app::{App, Command, Event, Snapshot, ToastKind};
+use paths::Paths;
+use worker::spawn_profile_worker;
 
 const USAGE: &str = "\
 mihomo-tui — a terminal client for the mihomo (Clash.Meta) API
@@ -84,8 +62,6 @@ struct Options {
     refresh_ms: u64,
     log_level: String,
     /// Relocates the whole mihomo-tui state tree; resolved by `Paths`.
-    // Read together with the paths module once subscription management lands.
-    #[allow(dead_code)]
     config_dir: Option<String>,
     /// Overrides the concurrency stored in `config.json` for delay tests.
     #[allow(dead_code)]
@@ -206,6 +182,12 @@ fn main() -> ExitCode {
 }
 
 async fn run(options: Options) -> Result<()> {
+    // Resolve and create the state tree before taking over the terminal: a
+    // bad `--config-dir` should fail like any other argument error, not
+    // leave the terminal in raw mode.
+    let paths = Paths::resolve(options.config_dir.as_deref())?;
+    paths.ensure()?;
+
     let client = Arc::new(Client::new(&options.endpoint, options.secret.clone())?);
 
     let mut terminal = ratatui::try_init()?;
@@ -221,11 +203,27 @@ async fn run(options: Options) -> Result<()> {
     app.set_toast(ToastKind::Info, format!("connecting to {}", app.endpoint));
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+    let (profile_tx, profile_rx) = mpsc::unbounded_channel::<Command>();
 
     spawn_key_reader(tx.clone());
     spawn_ticker(tx.clone());
     spawn_refresh(client.clone(), tx.clone(), options.refresh_ms);
     spawn_streams(client.clone(), tx.clone(), &options);
+    spawn_profile_worker(client.clone(), paths.clone(), profile_rx, tx.clone());
+
+    // The Subscriptions page is useful before the first command: seed it
+    // with whatever was imported in an earlier run.
+    match store::Store::load_profiles(&paths) {
+        Ok(profiles) => {
+            let _ = tx.send(Event::ProfilesUpdated(profiles));
+        }
+        Err(err) => {
+            let _ = tx.send(Event::Toast(
+                ToastKind::Error,
+                format!("reading subscriptions: {err:#}"),
+            ));
+        }
+    }
 
     terminal.draw(|frame| ui::draw(frame, &app, Instant::now()))?;
 
@@ -238,7 +236,11 @@ async fn run(options: Options) -> Result<()> {
 
         for event in events {
             if let Some(command) = app.on_event(event) {
-                spawn_command(command, client.clone(), tx.clone());
+                if is_profile_command(&command) {
+                    let _ = profile_tx.send(command);
+                } else {
+                    spawn_command(command, client.clone(), tx.clone());
+                }
             }
         }
 
@@ -250,6 +252,19 @@ async fn run(options: Options) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Subscription work is serialized through one worker; everything else keeps
+/// its own short-lived task.
+fn is_profile_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::SwitchProfile(_)
+            | Command::ConfirmSwitch { .. }
+            | Command::AddProfile { .. }
+            | Command::UpdateProfile(_)
+            | Command::DeleteProfile(_)
+    )
 }
 
 /// Read keys on a dedicated thread — `crossterm::event::read` blocks, and
@@ -480,19 +495,14 @@ async fn execute(
             ));
         }
         Command::Refresh => {}
-        // The profile worker takes these over in the next task. Until it
-        // exists they must still compile and must not pretend to have
-        // changed anything.
+        // Profile commands are routed to the profile worker before they
+        // reach this function; the unreachable arms keep the match
+        // exhaustive without silently doing subscription work here.
         Command::SwitchProfile(_)
         | Command::ConfirmSwitch { .. }
         | Command::AddProfile { .. }
         | Command::UpdateProfile(_)
-        | Command::DeleteProfile(_) => {
-            let _ = tx.send(Event::Toast(
-                ToastKind::Info,
-                "subscription actions are not wired up yet".into(),
-            ));
-        }
+        | Command::DeleteProfile(_) => {}
     }
 
     // Every action changes state, so pull a fresh snapshot right away rather

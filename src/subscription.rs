@@ -448,7 +448,7 @@ fn summarize_proxies(proxies: &Sequence) -> ImportReport {
 
 /// One-line summary for the profile list, e.g. `"vless(2), trojan(1)"`.
 /// Deterministic: protocols appear in alphabetical order.
-fn summarize(report: &ImportReport) -> String {
+pub(crate) fn summarize(report: &ImportReport) -> String {
     report
         .protocols
         .iter()

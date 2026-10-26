@@ -90,6 +90,8 @@ impl Block {
     }
 
     /// The label shown on the confirm page.
+    // Used by the confirmation overlay and the Subscriptions page (task 13).
+    #[allow(dead_code)]
     pub fn title(self) -> &'static str {
         match self {
             Block::Proxies => "Proxies",
@@ -171,7 +173,11 @@ impl Source {
 #[derive(Debug, Clone)]
 pub struct BlockDiff {
     pub block: Block,
+    // Rendered by the confirmation overlay (task 13); merge and the worker
+    // only need `equal`.
+    #[allow(dead_code)]
     pub base: Option<String>,
+    #[allow(dead_code)]
     pub sub: Option<String>,
     pub equal: bool,
 }
