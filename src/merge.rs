@@ -257,6 +257,28 @@ pub fn merge(base: &Mapping, sub: &Mapping, choices: &BTreeMap<Block, Source>) -
             _ => {}
         }
     }
+
+    // Cascade rules: if base specifies prepend-rules or append-rules,
+    // merge them into out["rules"] so custom user rules take precedence.
+    let prepend = base.get("prepend-rules").and_then(Value::as_sequence);
+    let append = base.get("append-rules").and_then(Value::as_sequence);
+    if prepend.is_some() || append.is_some() {
+        let current_rules = out
+            .get("rules")
+            .and_then(Value::as_sequence)
+            .cloned()
+            .unwrap_or_default();
+        let mut combined = Vec::new();
+        if let Some(p) = prepend {
+            combined.extend(p.iter().cloned());
+        }
+        combined.extend(current_rules);
+        if let Some(a) = append {
+            combined.extend(a.iter().cloned());
+        }
+        out.insert(Value::from("rules"), Value::Sequence(combined));
+    }
+
     Ok(out)
 }
 
@@ -1027,6 +1049,38 @@ mod tests {
         // The subscription carries no rules, so Rules/Subscription yields an
         // empty list — a real key, never a missing one.
         assert_eq!(merged.get("rules"), Some(&Value::Sequence(Vec::new())));
+    }
+
+    #[test]
+    fn prepend_and_append_rules_are_spliced_into_rules() {
+        let base = map_yaml(
+            "prepend-rules:\n\
+             - 'DOMAIN-SUFFIX,internal.corp,DIRECT'\n\
+             append-rules:\n\
+             - 'MATCH,GLOBAL'\n",
+        );
+        let sub = map_yaml(
+            "rules:\n\
+             - 'DOMAIN-SUFFIX,google.com,PROXY'\n\
+             - 'DOMAIN-KEYWORD,github,PROXY'\n",
+        );
+
+        let merged = merge(
+            &base,
+            &sub,
+            &choices(&[(Block::Rules, Source::Subscription)]),
+        )
+        .unwrap();
+
+        let rules = merged.get("rules").and_then(Value::as_sequence).unwrap();
+        assert_eq!(rules.len(), 4);
+        assert_eq!(
+            rules[0].as_str(),
+            Some("DOMAIN-SUFFIX,internal.corp,DIRECT")
+        );
+        assert_eq!(rules[1].as_str(), Some("DOMAIN-SUFFIX,google.com,PROXY"));
+        assert_eq!(rules[2].as_str(), Some("DOMAIN-KEYWORD,github,PROXY"));
+        assert_eq!(rules[3].as_str(), Some("MATCH,GLOBAL"));
     }
 
     #[test]
