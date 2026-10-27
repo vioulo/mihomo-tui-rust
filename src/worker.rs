@@ -87,9 +87,22 @@ impl ProfileWorker {
             Command::AddProfile { name, url } => self.add(&name, &url).await,
             Command::UpdateProfile(id) => self.update(&id).await,
             Command::DeleteProfile(id) => self.delete(&id).await,
+            Command::SaveRules { prepend, append } => self.save_rules(prepend, append).await,
             // Everything else belongs to `execute` in main; receiving one
             // here would be a routing bug, not a reason to crash.
             _ => {}
+        }
+    }
+
+    async fn save_rules(&mut self, prepend: Vec<String>, append: Vec<String>) {
+        if let Err(err) = Store::save_custom_rules(&self.paths, &prepend, &append) {
+            self.error_toast("failed to save custom rules", &err);
+            return;
+        }
+        self.send(Event::RulesUpdated { prepend, append });
+        self.toast(ToastKind::Success, "Custom rules saved to base.yaml");
+        if let Some(id) = self.current.clone() {
+            self.switch(&id).await;
         }
     }
 

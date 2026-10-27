@@ -6,16 +6,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Sparkline,
-    Table, TableState, Tabs,
+    Axis, Block, BorderType, Cell, Chart, Clear, Dataset, GraphType, List, ListItem, ListState,
+    Paragraph, Row, Table, TableState, Tabs,
 };
 
 use crate::api::Connection;
 use crate::app::{
-    App, InputField, InputOverlay, PendingSwitch, SettingsOverlay, Tab, format_bytes, format_rate,
-    sparkline_data,
+    App, InputField, InputOverlay, PendingSwitch, RulesOverlay, SettingsOverlay, Tab, format_bytes,
+    format_rate,
 };
 use crate::merge::Source;
 use crate::store::ProfileMeta;
@@ -74,8 +75,11 @@ pub fn draw(frame: &mut Frame, app: &App, now: Instant) {
     if let Some(input) = &app.input {
         draw_input_overlay(frame, input, area);
     }
+    if let Some(rules) = &app.rules {
+        draw_rules_overlay(frame, app, rules, area);
+    }
     if let Some(settings) = &app.settings {
-        draw_settings_overlay(frame, settings, area);
+        draw_settings_overlay(frame, app, settings, area);
     }
 }
 
@@ -175,6 +179,7 @@ fn action_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("u", "tun"),
             ("l", "lan"),
             ("o", "options"),
+            ("R", "rules"),
             ("r", "refresh"),
             ("tab", "switch"),
             ("q", "quit"),
@@ -221,11 +226,24 @@ fn action_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 }
 
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
-    let status_height = if app.offline.is_some() { 8 } else { 7 };
-    let areas =
-        Layout::vertical([Constraint::Length(status_height), Constraint::Min(0)]).split(area);
-    draw_status(frame, app, areas[0]);
-    draw_traffic(frame, app, areas[1]);
+    let status_height = if app.offline.is_some() { 9 } else { 8 };
+    if area.height >= 20 {
+        let traffic_height = 10.min(area.height.saturating_sub(status_height + 4));
+        let areas = Layout::vertical([
+            Constraint::Length(status_height),
+            Constraint::Length(traffic_height),
+            Constraint::Min(4),
+        ])
+        .split(area);
+        draw_status(frame, app, areas[0]);
+        draw_traffic(frame, app, areas[1]);
+        draw_custom_rules_panel(frame, app, areas[2]);
+    } else {
+        let areas =
+            Layout::vertical([Constraint::Length(status_height), Constraint::Min(0)]).split(area);
+        draw_status(frame, app, areas[0]);
+        draw_traffic(frame, app, areas[1]);
+    }
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -244,7 +262,28 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     };
     let host = app.endpoint.trim_end_matches('/');
 
-    let rows: [(Line, Line); 5] = [
+    let rules_val = if app.prepend_rules.is_empty() && app.append_rules.is_empty() {
+        Line::from(vec![
+            Span::styled("none", Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled("(press R to configure)", Style::default().fg(MUTED)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} prepend, {} append",
+                    app.prepend_rules.len(),
+                    app.append_rules.len()
+                ),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw("  "),
+            Span::styled("press R to manage", Style::default().fg(MUTED)),
+        ])
+    };
+
+    let rows: [(Line, Line); 6] = [
         (
             label_line("Endpoint"),
             Line::from(vec![
@@ -289,6 +328,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 },
             )),
         ),
+        (label_line("Rules"), rules_val),
     ];
 
     let mut lines = Vec::new();
@@ -306,39 +346,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_traffic(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel("Traffic");
+    let block = panel("Traffic (Realtime Curve)");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let total = format!(
-        "↑ {}   ↓ {}",
-        format_bytes(app.connections.upload_total),
-        format_bytes(app.connections.download_total)
-    );
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
 
-    let areas = Layout::vertical([
-        Constraint::Length(1), // live rates
-        Constraint::Length(1), // up ratio gauge
-        Constraint::Length(1), // down ratio gauge
-        Constraint::Length(1), // totals
-        Constraint::Min(1),    // graphs
-        Constraint::Length(1), // graph titles
-    ])
-    .split(inner);
+    let total_up = format_bytes(app.connections.upload_total);
+    let total_down = format_bytes(app.connections.download_total);
+    let conns = app.connections.connections.len();
 
-    let rates = Line::from(vec![
-        Span::styled("↑ ", Style::default().fg(UP)),
-        Span::styled(format_rate(app.traffic.up), Style::default().fg(UP).bold()),
-        Span::raw("    "),
-        Span::styled("↓ ", Style::default().fg(DOWN)),
-        Span::styled(
-            format_rate(app.traffic.down),
-            Style::default().fg(DOWN).bold(),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(rates), areas[0]);
-
-    // Scale both bars against the same peak so they are comparable at a glance.
     let peak = app
         .traffic
         .up_history
@@ -347,64 +366,198 @@ fn draw_traffic(frame: &mut Frame, app: &App, area: Rect) {
         .copied()
         .max()
         .unwrap_or(0)
-        .max(1);
-    frame.render_widget(traffic_gauge("up", app.traffic.up, peak, UP), areas[1]);
-    frame.render_widget(
-        traffic_gauge("down", app.traffic.down, peak, DOWN),
-        areas[2],
-    );
+        .max(1024);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("total  ", Style::default().fg(MUTED)),
-            Span::styled(total, Style::default().fg(Color::White)),
-            Span::raw("    "),
-            Span::styled(
-                format!("{} connections", app.connections.connections.len()),
-                Style::default().fg(MUTED),
-            ),
-        ])),
-        areas[3],
-    );
+    let summary = Line::from(vec![
+        Span::styled("↑ ", Style::default().fg(UP).bold()),
+        Span::styled(
+            format!("{:<8}", format_rate(app.traffic.up)),
+            Style::default().fg(UP).bold(),
+        ),
+        Span::styled(format!("({total_up})"), Style::default().fg(MUTED)),
+        Span::raw("   "),
+        Span::styled("↓ ", Style::default().fg(DOWN).bold()),
+        Span::styled(
+            format!("{:<8}", format_rate(app.traffic.down)),
+            Style::default().fg(DOWN).bold(),
+        ),
+        Span::styled(format!("({total_down})"), Style::default().fg(MUTED)),
+        Span::raw("   "),
+        Span::styled("peak ", Style::default().fg(MUTED)),
+        Span::styled(format_rate(peak), Style::default().fg(Color::White)),
+        Span::raw("   "),
+        Span::styled(format!("{conns} conns"), Style::default().fg(MUTED)),
+    ]);
 
-    let graphs =
-        Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(areas[4]);
-    let up_data = sparkline_data(&app.traffic.up_history);
-    let down_data = sparkline_data(&app.traffic.down_history);
+    if inner.height <= 3 {
+        frame.render_widget(Paragraph::new(summary), inner);
+        return;
+    }
 
-    frame.render_widget(
-        Sparkline::default()
-            .data(up_data)
-            .max(peak)
-            .style(Style::default().fg(UP)),
-        graphs[0],
-    );
-    frame.render_widget(
-        Sparkline::default()
-            .data(down_data)
-            .max(peak)
-            .style(Style::default().fg(DOWN)),
-        graphs[1],
-    );
+    let areas = Layout::vertical([
+        Constraint::Length(1), // summary line
+        Constraint::Min(2),    // braille chart
+    ])
+    .split(inner);
 
-    let hint = if app.traffic.up_history.is_empty() {
-        Line::from("waiting for samples…").fg(MUTED)
+    frame.render_widget(Paragraph::new(summary), areas[0]);
+
+    let up_history = &app.traffic.up_history;
+    let down_history = &app.traffic.down_history;
+
+    let up_points: Vec<(f64, f64)> = if up_history.is_empty() {
+        vec![(0.0, 0.0)]
     } else {
-        Line::from(vec![
-            Span::styled("peak ", Style::default().fg(MUTED)),
-            Span::styled(format_rate(peak), Style::default().fg(Color::White)),
-            Span::styled("   (last 120 samples)", Style::default().fg(MUTED)),
-        ])
+        up_history
+            .iter()
+            .enumerate()
+            .map(|(i, &rate)| (i as f64, rate as f64))
+            .collect()
     };
-    frame.render_widget(Paragraph::new(hint), areas[5]);
+
+    let down_points: Vec<(f64, f64)> = if down_history.is_empty() {
+        vec![(0.0, 0.0)]
+    } else {
+        down_history
+            .iter()
+            .enumerate()
+            .map(|(i, &rate)| (i as f64, rate as f64))
+            .collect()
+    };
+
+    let max_x = (up_history.len().max(down_history.len()).max(1) as f64).max(30.0);
+
+    let dataset_up = Dataset::default()
+        .name("↑ Up")
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(UP))
+        .data(&up_points);
+
+    let dataset_down = Dataset::default()
+        .name("↓ Down")
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(DOWN))
+        .data(&down_points);
+
+    let x_axis = Axis::default()
+        .style(Style::default().fg(MUTED))
+        .bounds([0.0, max_x])
+        .labels(vec![
+            Span::styled("30s ago", Style::default().fg(MUTED)),
+            Span::styled("15s", Style::default().fg(MUTED)),
+            Span::styled("now", Style::default().fg(MUTED)),
+        ]);
+
+    let y_axis = Axis::default()
+        .style(Style::default().fg(MUTED))
+        .bounds([0.0, peak as f64])
+        .labels(vec![
+            Span::styled("0", Style::default().fg(MUTED)),
+            Span::styled(format_rate(peak / 2), Style::default().fg(MUTED)),
+            Span::styled(format_rate(peak), Style::default().fg(Color::White)),
+        ]);
+
+    let chart = Chart::new(vec![dataset_up, dataset_down])
+        .x_axis(x_axis)
+        .y_axis(y_axis);
+
+    frame.render_widget(chart, areas[1]);
 }
 
-fn traffic_gauge(label: &str, value: u64, peak: u64, color: Color) -> Gauge<'_> {
-    Gauge::default()
-        .ratio(ratio(value, peak))
-        .label(format!("{label} {}", format_rate(value)))
-        .style(Style::default().fg(MUTED))
-        .gauge_style(Style::default().fg(color))
+fn draw_custom_rules_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = panel("Custom Rules (base.yaml)");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.prepend_rules.is_empty() && app.append_rules.is_empty() {
+        let msg = vec![
+            Line::from(vec![Span::styled(
+                "No custom rules configured in base.yaml",
+                Style::default().fg(MUTED),
+            )]),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(MUTED)),
+                Span::styled("R", Style::default().fg(ACCENT).bold()),
+                Span::styled(
+                    " to add Prepend (置顶优先) or Append (追加兜底) rules.",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(msg), inner);
+        return;
+    }
+
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+
+    let max_display = cols[0].height.saturating_sub(1) as usize;
+
+    // Left: Prepend Rules
+    let mut prepend_lines = vec![Line::from(vec![
+        Span::styled(
+            "● Prepend Rules (置顶优先) ",
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+        Span::styled(
+            format!("({})", app.prepend_rules.len()),
+            Style::default().fg(MUTED),
+        ),
+    ])];
+    if app.prepend_rules.is_empty() {
+        prepend_lines.push(Line::from("  (none)").fg(MUTED));
+    } else {
+        for (i, rule) in app.prepend_rules.iter().take(max_display).enumerate() {
+            prepend_lines.push(Line::from(vec![
+                Span::styled(format!("  {}. ", i + 1), Style::default().fg(MUTED)),
+                Span::styled(rule.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+        if app.prepend_rules.len() > max_display {
+            prepend_lines.push(
+                Line::from(format!(
+                    "  … +{} more",
+                    app.prepend_rules.len() - max_display
+                ))
+                .fg(MUTED),
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(prepend_lines), cols[0]);
+
+    // Right: Append Rules
+    let mut append_lines = vec![Line::from(vec![
+        Span::styled(
+            "○ Append Rules (追加兜底) ",
+            Style::default().fg(Color::Cyan).bold(),
+        ),
+        Span::styled(
+            format!("({})", app.append_rules.len()),
+            Style::default().fg(MUTED),
+        ),
+    ])];
+    if app.append_rules.is_empty() {
+        append_lines.push(Line::from("  (none)").fg(MUTED));
+    } else {
+        for (i, rule) in app.append_rules.iter().take(max_display).enumerate() {
+            append_lines.push(Line::from(vec![
+                Span::styled(format!("  {}. ", i + 1), Style::default().fg(MUTED)),
+                Span::styled(rule.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+        if app.append_rules.len() > max_display {
+            append_lines.push(
+                Line::from(format!(
+                    "  … +{} more",
+                    app.append_rules.len() - max_display
+                ))
+                .fg(MUTED),
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(append_lines), cols[1]);
 }
 
 fn draw_proxies(frame: &mut Frame, app: &App, area: Rect) {
@@ -807,6 +960,7 @@ fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+#[allow(dead_code)]
 /// Traffic ratios are fed straight into `Gauge::ratio`, which panics outside 0..=1.
 fn ratio(value: u64, peak: u64) -> f64 {
     if peak == 0 {
@@ -1131,11 +1285,11 @@ fn draw_input_overlay(frame: &mut Frame, overlay: &InputOverlay, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_settings_overlay(frame: &mut Frame, settings: &SettingsOverlay, area: Rect) {
+fn draw_settings_overlay(frame: &mut Frame, app: &App, settings: &SettingsOverlay, area: Rect) {
     let popup = centered_rect(
         area,
         area.width.saturating_sub(4).min(56),
-        8.min(area.height),
+        10.min(area.height),
     );
     frame.render_widget(Clear, popup);
 
@@ -1182,17 +1336,164 @@ fn draw_settings_overlay(frame: &mut Frame, settings: &SettingsOverlay, area: Re
     } else {
         "[○ OFF]"
     };
+    let rules_val = format!(
+        "{} prepend, {} append  [enter to open]",
+        app.prepend_rules.len(),
+        app.append_rules.len()
+    );
 
     let lines = vec![
         row(0, "Mode", &mode_val),
         row(1, "Mixed Port", &port_val),
         row(2, "Allow LAN", lan_val),
         row(3, "TUN Mode", tun_val),
+        row(4, "Custom Rules", &rules_val),
         Line::from(""),
-        Line::from("↑↓ move  Space toggle  enter apply  Esc cancel")
+        Line::from("↑↓ move  Space toggle  enter apply/open  Esc cancel")
             .style(Style::default().fg(MUTED)),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_rules_overlay(frame: &mut Frame, app: &App, rules: &RulesOverlay, area: Rect) {
+    let popup = centered_rect(
+        area,
+        area.width.saturating_sub(4).min(72),
+        16.min(area.height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(
+            Line::from(" Custom Rules Management (base.yaml) ")
+                .style(Style::default().fg(ACCENT).bold()),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let bottom_height = if rules.adding { 3 } else { 1 };
+    let areas = Layout::vertical([
+        Constraint::Length(1),             // tabs: [Prepend Rules]  [Append Rules]
+        Constraint::Length(1),             // separator
+        Constraint::Min(3),                // list of rules
+        Constraint::Length(bottom_height), // input prompt or key hints
+    ])
+    .split(inner);
+
+    // Tab switcher
+    let prepend_style = if rules.is_prepend {
+        Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let append_style = if !rules.is_prepend {
+        Style::default().fg(Color::Black).bg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(MUTED)
+    };
+
+    let tabs_line = Line::from(vec![
+        Span::styled(
+            format!(" Prepend ({}) [置顶优先] ", app.prepend_rules.len()),
+            prepend_style,
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!(" Append ({}) [追加兜底] ", app.append_rules.len()),
+            append_style,
+        ),
+        Span::raw("   "),
+        Span::styled("(Tab to switch category)", Style::default().fg(MUTED)),
+    ]);
+    frame.render_widget(Paragraph::new(tabs_line), areas[0]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from("─".repeat(areas[1].width as usize)).fg(MUTED)),
+        areas[1],
+    );
+
+    // List of rules in currently active category
+    let current_list = if rules.is_prepend {
+        &app.prepend_rules
+    } else {
+        &app.append_rules
+    };
+
+    if current_list.is_empty() {
+        let empty_msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from("  No rules in this category. Press 'a' to add a rule.").fg(MUTED),
+            Line::from("  Example: DOMAIN-SUFFIX,google.com,PROXY or GEOIP,CN,DIRECT").fg(MUTED),
+        ]);
+        frame.render_widget(empty_msg, areas[2]);
+    } else {
+        let max_visible = areas[2].height as usize;
+        let scroll_offset = if rules.cursor >= max_visible {
+            rules.cursor - max_visible + 1
+        } else {
+            0
+        };
+
+        let mut lines = Vec::new();
+        for (i, rule) in current_list
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(max_visible)
+        {
+            let selected = i == rules.cursor && !rules.adding;
+            let prefix = if selected { " ▶ " } else { "   " };
+            let style = if selected {
+                Style::default().fg(ACCENT).bold()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(format!("{:<3} ", i + 1), Style::default().fg(MUTED)),
+                Span::styled(rule.clone(), style),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), areas[2]);
+    }
+
+    // Input prompt or instructions
+    if rules.adding {
+        let input_block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(
+                Line::from(" Add Rule (e.g. DOMAIN-SUFFIX,openai.com,PROXY) ")
+                    .style(Style::default().fg(Color::Yellow)),
+            );
+        let input_inner = input_block.inner(areas[3]);
+        frame.render_widget(input_block, areas[3]);
+
+        let prompt_line = Line::from(vec![
+            Span::raw("> "),
+            Span::styled(&rules.input_text, Style::default().fg(Color::White).bold()),
+            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::raw("    "),
+            Span::styled("enter confirm   Esc cancel", Style::default().fg(MUTED)),
+        ]);
+        frame.render_widget(Paragraph::new(prompt_line), input_inner);
+    } else {
+        let hints = Line::from(vec![
+            Span::styled("Tab", Style::default().fg(ACCENT)),
+            Span::styled(" switch category   ", Style::default().fg(MUTED)),
+            Span::styled("j/k", Style::default().fg(ACCENT)),
+            Span::styled(" move   ", Style::default().fg(MUTED)),
+            Span::styled("a", Style::default().fg(ACCENT)),
+            Span::styled(" add rule   ", Style::default().fg(MUTED)),
+            Span::styled("d", Style::default().fg(ACCENT)),
+            Span::styled(" delete   ", Style::default().fg(MUTED)),
+            Span::styled("Esc", Style::default().fg(ACCENT)),
+            Span::styled(" close", Style::default().fg(MUTED)),
+        ]);
+        frame.render_widget(Paragraph::new(hints), areas[3]);
+    }
 }
 
 #[cfg(test)]
@@ -1659,5 +1960,47 @@ mod tests {
         assert!(screen.contains("no subscriptions yet"));
         assert!(!screen.contains("Version"));
         assert!(!screen.contains("Traffic"));
+    }
+
+    #[test]
+    fn rules_overlay_renders() {
+        let mut app = app();
+        app.prepend_rules = vec!["DOMAIN-SUFFIX,google.com,PROXY".to_string()];
+        app.append_rules = vec!["MATCH,DIRECT".to_string()];
+        app.rules = Some(RulesOverlay {
+            is_prepend: true,
+            cursor: 0,
+            adding: false,
+            input_text: String::new(),
+        });
+
+        let screen = render(&app, 100, 30);
+        assert!(
+            screen.contains("Custom Rules Management (base.yaml)"),
+            "{screen}"
+        );
+        assert!(screen.contains("Prepend (1)"), "{screen}");
+        assert!(screen.contains("Append (1)"), "{screen}");
+        assert!(
+            screen.contains("DOMAIN-SUFFIX,google.com,PROXY"),
+            "{screen}"
+        );
+        assert!(screen.contains("Tab switch category"), "{screen}");
+    }
+
+    #[test]
+    fn overview_renders_curve_traffic_and_custom_rules_panel() {
+        let mut app = app();
+        app.prepend_rules = vec!["GEOIP,CN,DIRECT".to_string()];
+        app.append_rules = vec!["MATCH,PROXY".to_string()];
+
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("Status"), "{screen}");
+        assert!(screen.contains("Traffic (Realtime Curve)"), "{screen}");
+        assert!(screen.contains("Custom Rules (base.yaml)"), "{screen}");
+        assert!(screen.contains("Prepend Rules"), "{screen}");
+        assert!(screen.contains("GEOIP,CN,DIRECT"), "{screen}");
+        assert!(screen.contains("Append Rules"), "{screen}");
+        assert!(screen.contains("MATCH,PROXY"), "{screen}");
     }
 }

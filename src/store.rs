@@ -158,6 +158,88 @@ impl Store {
         let path = Self::snapshot_path(p, id);
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
     }
+
+    /// Read custom rules from base.yaml: (prepend-rules, append-rules).
+    pub fn load_custom_rules(p: &Paths) -> Result<(Vec<String>, Vec<String>)> {
+        let path = p.base_yaml();
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let mapping = match value {
+            serde_yaml_ng::Value::Mapping(m) => m,
+            serde_yaml_ng::Value::Null => return Ok((Vec::new(), Vec::new())),
+            _ => return Ok((Vec::new(), Vec::new())),
+        };
+
+        let parse_rules = |key: &str| -> Vec<String> {
+            mapping
+                .get(key)
+                .and_then(serde_yaml_ng::Value::as_sequence)
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|item| match item {
+                            serde_yaml_ng::Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        Ok((parse_rules("prepend-rules"), parse_rules("append-rules")))
+    }
+
+    /// Write custom rules to base.yaml, preserving any other keys.
+    pub fn save_custom_rules(p: &Paths, prepend: &[String], append: &[String]) -> Result<()> {
+        let path = p.base_yaml();
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+
+        let mut mapping = if text.trim().is_empty() {
+            serde_yaml_ng::Mapping::new()
+        } else {
+            let val: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            match val {
+                serde_yaml_ng::Value::Mapping(m) => m,
+                serde_yaml_ng::Value::Null => serde_yaml_ng::Mapping::new(),
+                _ => anyhow::bail!("{} is not a YAML mapping", path.display()),
+            }
+        };
+
+        let to_seq = |rules: &[String]| -> serde_yaml_ng::Value {
+            serde_yaml_ng::Value::Sequence(
+                rules
+                    .iter()
+                    .map(|r| serde_yaml_ng::Value::String(r.clone()))
+                    .collect(),
+            )
+        };
+
+        let prepend_key = serde_yaml_ng::Value::String("prepend-rules".into());
+        if prepend.is_empty() {
+            mapping.remove(&prepend_key);
+        } else {
+            mapping.insert(prepend_key, to_seq(prepend));
+        }
+
+        let append_key = serde_yaml_ng::Value::String("append-rules".into());
+        if append.is_empty() {
+            mapping.remove(&append_key);
+        } else {
+            mapping.insert(append_key, to_seq(append));
+        }
+
+        let out = serde_yaml_ng::to_string(&mapping).context("serializing base.yaml")?;
+        write_atomic(&path, &out)
+    }
 }
 
 /// The next free id in `s{n}` form (`s1`, `s2`, …): one past the highest
@@ -349,5 +431,34 @@ mod tests {
         );
 
         assert!(Store::touch_updated(&paths, "ghost", "x", 1, "y", 3_000).is_err());
+    }
+
+    #[test]
+    fn custom_rules_load_and_save_roundtrip() {
+        let (_tmp, paths) = paths();
+
+        // 1. Missing base.yaml yields empty lists
+        let (prepend, append) = Store::load_custom_rules(&paths).unwrap();
+        assert!(prepend.is_empty());
+        assert!(append.is_empty());
+
+        // 2. Save custom rules
+        let prepend_sample = vec![
+            "DOMAIN-SUFFIX,google.com,PROXY".to_string(),
+            "GEOIP,CN,DIRECT".to_string(),
+        ];
+        let append_sample = vec!["MATCH,DIRECT".to_string()];
+        Store::save_custom_rules(&paths, &prepend_sample, &append_sample).unwrap();
+
+        // 3. Load back and verify
+        let (p_loaded, a_loaded) = Store::load_custom_rules(&paths).unwrap();
+        assert_eq!(p_loaded, prepend_sample);
+        assert_eq!(a_loaded, append_sample);
+
+        // 4. Overwrite preserving file
+        Store::save_custom_rules(&paths, &[], &["MATCH,PROXY".to_string()]).unwrap();
+        let (p_empty, a_updated) = Store::load_custom_rules(&paths).unwrap();
+        assert!(p_empty.is_empty());
+        assert_eq!(a_updated, vec!["MATCH,PROXY".to_string()]);
     }
 }

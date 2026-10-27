@@ -138,6 +138,11 @@ pub enum Command {
     UpdateProfile(String),
     /// Remove a subscription and its snapshot.
     DeleteProfile(String),
+    /// Save custom prepend-rules and append-rules to base.yaml.
+    SaveRules {
+        prepend: Vec<String>,
+        append: Vec<String>,
+    },
 }
 
 /// Results flowing back into the app from the background tasks.
@@ -185,6 +190,11 @@ pub enum Event {
     },
     /// The profile list changed: add, update, delete or a finished switch.
     ProfilesUpdated(Vec<ProfileMeta>),
+    /// Custom rules in base.yaml were updated.
+    RulesUpdated {
+        prepend: Vec<String>,
+        append: Vec<String>,
+    },
     /// A config file changed on disk. Never applied automatically.
     ExternalChange {
         path: String,
@@ -249,6 +259,16 @@ pub struct SettingsOverlay {
     pub cursor: usize,
 }
 
+/// The custom prepend/append rules management overlay.
+#[derive(Debug, Clone)]
+pub struct RulesOverlay {
+    /// true: Prepend Rules (置顶/优先), false: Append Rules (追加/兜底)
+    pub is_prepend: bool,
+    pub cursor: usize,
+    pub adding: bool,
+    pub input_text: String,
+}
+
 pub struct App {
     pub tab: Tab,
     pub should_quit: bool,
@@ -291,6 +311,12 @@ pub struct App {
     pub input: Option<InputOverlay>,
     /// Open quick settings / options form.
     pub settings: Option<SettingsOverlay>,
+    /// Open custom rules form.
+    pub rules: Option<RulesOverlay>,
+    /// Custom prepend rules loaded from base.yaml.
+    pub prepend_rules: Vec<String>,
+    /// Custom append rules loaded from base.yaml.
+    pub append_rules: Vec<String>,
     /// Path of the config file changed externally, awaiting re-apply.
     pub external_dirty: Option<String>,
     /// Profile id waiting for the second `d` of the two-stage delete.
@@ -362,6 +388,9 @@ impl App {
             pending: None,
             input: None,
             settings: None,
+            rules: None,
+            prepend_rules: Vec::new(),
+            append_rules: Vec::new(),
             external_dirty: None,
             delete_armed: None,
             tab_width: Cell::new(0),
@@ -370,6 +399,15 @@ impl App {
             members_area: Cell::new(Rect::default()),
             members_top: Cell::new(0),
         }
+    }
+
+    pub fn open_rules(&mut self) {
+        self.rules = Some(RulesOverlay {
+            is_prepend: true,
+            cursor: 0,
+            adding: false,
+            input_text: String::new(),
+        });
     }
 
     pub fn mode(&self) -> &str {
@@ -481,6 +519,9 @@ impl App {
             return None;
         }
 
+        if self.rules.is_some() {
+            return self.on_key_rules(key);
+        }
         if self.settings.is_some() {
             return self.on_key_settings(key);
         }
@@ -623,6 +664,10 @@ impl App {
                     configs.tun.enable = next;
                 }
                 Some(Command::SetTun(next))
+            }
+            KeyCode::Char('R') => {
+                self.open_rules();
+                None
             }
             _ => None,
         }
@@ -963,7 +1008,7 @@ impl App {
                 None
             }
             KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
-                if settings.cursor < 3 {
+                if settings.cursor < 4 {
                     settings.cursor += 1;
                 } else if key.code == KeyCode::Tab {
                     settings.cursor = 0;
@@ -974,7 +1019,7 @@ impl App {
                 if settings.cursor > 0 {
                     settings.cursor -= 1;
                 } else {
-                    settings.cursor = 3;
+                    settings.cursor = 4;
                 }
                 None
             }
@@ -999,6 +1044,11 @@ impl App {
                     3 => {
                         settings.tun = !settings.tun;
                     }
+                    4 => {
+                        self.settings = None;
+                        self.open_rules();
+                        return None;
+                    }
                     _ => {}
                 }
                 None
@@ -1017,6 +1067,10 @@ impl App {
             }
             KeyCode::Enter => {
                 let settings = self.settings.take().unwrap();
+                if settings.cursor == 4 {
+                    self.open_rules();
+                    return None;
+                }
                 let port: u16 = settings.mixed_port.parse().unwrap_or(7890);
                 if let Some(configs) = self.configs.as_mut() {
                     configs.mixed_port = port;
@@ -1032,6 +1086,121 @@ impl App {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Keys on the custom rules management form.
+    fn on_key_rules(&mut self, key: KeyEvent) -> Option<Command> {
+        let rules = self.rules.as_mut()?;
+        if rules.adding {
+            match key.code {
+                KeyCode::Esc => {
+                    rules.adding = false;
+                    rules.input_text.clear();
+                    None
+                }
+                KeyCode::Backspace => {
+                    rules.input_text.pop();
+                    None
+                }
+                KeyCode::Char(c) => {
+                    rules.input_text.push(c);
+                    None
+                }
+                KeyCode::Enter => {
+                    let text = rules.input_text.trim().to_string();
+                    rules.adding = false;
+                    rules.input_text.clear();
+                    if !text.is_empty() {
+                        if rules.is_prepend {
+                            self.prepend_rules.push(text);
+                            rules.cursor = self.prepend_rules.len().saturating_sub(1);
+                        } else {
+                            self.append_rules.push(text);
+                            rules.cursor = self.append_rules.len().saturating_sub(1);
+                        }
+                        self.toast = Some(Toast {
+                            kind: ToastKind::Success,
+                            text: "Custom rule added".to_string(),
+                            at: Instant::now(),
+                        });
+                        Some(Command::SaveRules {
+                            prepend: self.prepend_rules.clone(),
+                            append: self.append_rules.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            let list_len = if rules.is_prepend {
+                self.prepend_rules.len()
+            } else {
+                self.append_rules.len()
+            };
+
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.rules = None;
+                    None
+                }
+                KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('h')
+                | KeyCode::Char('l') => {
+                    rules.is_prepend = !rules.is_prepend;
+                    rules.cursor = 0;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if rules.cursor > 0 {
+                        rules.cursor -= 1;
+                    }
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if list_len > 0 && rules.cursor + 1 < list_len {
+                        rules.cursor += 1;
+                    }
+                    None
+                }
+                KeyCode::Char('a') => {
+                    rules.adding = true;
+                    rules.input_text.clear();
+                    None
+                }
+                KeyCode::Char('d') => {
+                    if list_len > 0 && rules.cursor < list_len {
+                        if rules.is_prepend {
+                            self.prepend_rules.remove(rules.cursor);
+                            if rules.cursor >= self.prepend_rules.len() && rules.cursor > 0 {
+                                rules.cursor -= 1;
+                            }
+                        } else {
+                            self.append_rules.remove(rules.cursor);
+                            if rules.cursor >= self.append_rules.len() && rules.cursor > 0 {
+                                rules.cursor -= 1;
+                            }
+                        }
+                        self.toast = Some(Toast {
+                            kind: ToastKind::Info,
+                            text: "Rule deleted".to_string(),
+                            at: Instant::now(),
+                        });
+                        Some(Command::SaveRules {
+                            prepend: self.prepend_rules.clone(),
+                            append: self.append_rules.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
         }
     }
 
@@ -1199,6 +1368,11 @@ impl App {
                 self.sub_idx = self.sub_idx.min(self.profiles.len().saturating_sub(1));
                 None
             }
+            Event::RulesUpdated { prepend, append } => {
+                self.prepend_rules = prepend;
+                self.append_rules = append;
+                None
+            }
             Event::ExternalChange { path } => {
                 self.external_dirty = Some(path);
                 None
@@ -1247,11 +1421,6 @@ pub fn format_bytes(n: u64) -> String {
 /// A transfer rate, for the live traffic readout.
 pub fn format_rate(n: u64) -> String {
     format!("{}/s", format_bytes(n))
-}
-
-/// Traffic history as u64 for the sparkline widget.
-pub fn sparkline_data(history: &VecDeque<u64>) -> Vec<u64> {
-    history.iter().copied().collect()
 }
 
 #[cfg(test)]
@@ -2280,5 +2449,82 @@ mod tests {
         assert!(app.sort_by_delay);
         assert_eq!(app.on_key(key(KeyCode::Char('s'))), None);
         assert!(!app.sort_by_delay);
+    }
+
+    #[test]
+    fn rules_overlay_navigation_add_and_delete() {
+        let mut app = app_with_groups();
+        app.tab = Tab::Overview;
+
+        // 1. Shift+R opens rules overlay
+        app.on_key(key(KeyCode::Char('R')));
+        assert!(app.rules.is_some());
+        let rules = app.rules.as_ref().unwrap();
+        assert!(rules.is_prepend);
+        assert_eq!(rules.cursor, 0);
+        assert!(!rules.adding);
+
+        // 2. Tab toggles to append rules
+        app.on_key(key(KeyCode::Tab));
+        assert!(!app.rules.as_ref().unwrap().is_prepend);
+
+        // 3. Tab toggles back to prepend rules
+        app.on_key(key(KeyCode::Tab));
+        assert!(app.rules.as_ref().unwrap().is_prepend);
+
+        // 4. 'a' enters adding mode
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.rules.as_ref().unwrap().adding);
+
+        // 5. Type rule "MATCH,DIRECT" and Enter
+        for c in "MATCH,DIRECT".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let save_cmd = app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            save_cmd,
+            Some(Command::SaveRules {
+                prepend: vec!["MATCH,DIRECT".to_string()],
+                append: vec![],
+            })
+        );
+        assert_eq!(app.prepend_rules, vec!["MATCH,DIRECT".to_string()]);
+        assert!(!app.rules.as_ref().unwrap().adding);
+
+        // 6. 'd' deletes the rule
+        let delete_cmd = app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(
+            delete_cmd,
+            Some(Command::SaveRules {
+                prepend: vec![],
+                append: vec![],
+            })
+        );
+        assert!(app.prepend_rules.is_empty());
+
+        // 7. Esc closes the overlay
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.rules.is_none());
+    }
+
+    #[test]
+    fn settings_overlay_opens_rules_on_item_4() {
+        let mut app = app_with_groups();
+        app.tab = Tab::Overview;
+
+        // 'o' opens settings
+        app.on_key(key(KeyCode::Char('o')));
+        assert!(app.settings.is_some());
+
+        // Navigate down to item 4 (Custom Rules)
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 4);
+
+        // Enter opens rules overlay and closes settings
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.settings.is_none());
+        assert!(app.rules.is_some());
     }
 }

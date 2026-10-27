@@ -242,6 +242,7 @@ async fn run(options: Options) -> Result<()> {
     spawn_test_pool(client.clone(), concurrency, test_rx, tx.clone());
 
     // The Subscriptions page is useful before the first command: seed it
+    // The Subscriptions page is useful before the first command: seed it
     // with whatever was imported in an earlier run.
     match store::Store::load_profiles(&paths) {
         Ok(profiles) => {
@@ -251,6 +252,18 @@ async fn run(options: Options) -> Result<()> {
             let _ = tx.send(Event::Toast(
                 ToastKind::Error,
                 format!("reading subscriptions: {err:#}"),
+            ));
+        }
+    }
+
+    match store::Store::load_custom_rules(&paths) {
+        Ok((prepend, append)) => {
+            let _ = tx.send(Event::RulesUpdated { prepend, append });
+        }
+        Err(err) => {
+            let _ = tx.send(Event::Toast(
+                ToastKind::Error,
+                format!("reading custom rules: {err:#}"),
             ));
         }
     }
@@ -296,6 +309,7 @@ fn is_profile_command(command: &Command) -> bool {
             | Command::AddProfile { .. }
             | Command::UpdateProfile(_)
             | Command::DeleteProfile(_)
+            | Command::SaveRules { .. }
     )
 }
 
@@ -564,7 +578,8 @@ async fn execute(
         | Command::ConfirmSwitch { .. }
         | Command::AddProfile { .. }
         | Command::UpdateProfile(_)
-        | Command::DeleteProfile(_) => {}
+        | Command::DeleteProfile(_)
+        | Command::SaveRules { .. } => {}
     }
 
     // Every action changes state, so pull a fresh snapshot right away rather
