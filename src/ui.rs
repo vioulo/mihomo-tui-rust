@@ -637,8 +637,6 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // The table needs a column to spare for the delay bar.
-    let show_bar = inner.width > 60;
     let areas = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -653,8 +651,6 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("member", Style::default().fg(MUTED).bold()),
         Span::raw("  "),
         Span::styled("type", Style::default().fg(MUTED).bold()),
-        Span::raw("  "),
-        Span::styled("delay", Style::default().fg(MUTED).bold()),
     ]);
     frame.render_widget(Paragraph::new(header), areas[0]);
 
@@ -679,39 +675,26 @@ fn draw_member_list(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::White)
             };
             let marker = if current { "▶ " } else { "  " };
-            let (delay_text, delay_style) = match member.delay {
-                Some(delay) => (
-                    format!("{delay} ms"),
-                    Style::default().fg(delay_color(delay)),
-                ),
-                None => ("-".to_string(), Style::default().fg(MUTED)),
-            };
 
-            let mut cells = vec![
-                Cell::from(format!("{marker}{}", member.name)).style(name_style),
+            // The status prefix leads the row so latency reads before the name.
+            let name = Line::from(vec![
+                Span::styled(marker, name_style),
+                delay_prefix(member.delay),
+                Span::raw(" "),
+                Span::styled(member.name.clone(), name_style),
+            ]);
+            let cells = vec![
+                Cell::from(name),
                 Cell::from(member.kind.clone()).style(Style::default().fg(MUTED)),
-                Cell::from(delay_text).style(delay_style),
             ];
-            if show_bar {
-                cells.push(Cell::from(delay_bar(member.delay)));
-            }
             Row::new(cells)
         })
         .collect();
 
-    let widths = if show_bar {
-        vec![
-            Constraint::Min(18),
-            Constraint::Length(14),
-            Constraint::Length(9),
-            Constraint::Length(10),
-        ]
+    let widths = if inner.width > 60 {
+        vec![Constraint::Min(18), Constraint::Length(14)]
     } else {
-        vec![
-            Constraint::Min(16),
-            Constraint::Length(12),
-            Constraint::Length(9),
-        ]
+        vec![Constraint::Min(16), Constraint::Length(12)]
     };
 
     let mut state = TableState::default();
@@ -987,19 +970,22 @@ fn delay_color(delay: u64) -> Color {
     }
 }
 
-/// A tiny inline bar so latency is readable at a glance.
-fn delay_bar(delay: Option<u64>) -> Span<'static> {
-    let Some(delay) = delay else {
-        return Span::styled("··········", Style::default().fg(MUTED));
-    };
-    const SLOTS: usize = 10;
-    // 0 ms is full, 1000 ms or worse is empty.
-    let filled = SLOTS - ((delay as usize).min(1000) * SLOTS / 1000);
-    let color = delay_color(delay);
-    Span::styled(
-        format!("{}{}", "█".repeat(filled), "░".repeat(SLOTS - filled)),
-        Style::default().fg(color),
-    )
+/// The fixed-width `[●|  42ms]` status prefix that leads each member row.
+fn delay_prefix(delay: Option<u64>) -> Span<'static> {
+    match delay {
+        Some(delay) => {
+            let text = if delay > 9999 {
+                ">999ms".to_string()
+            } else {
+                format!("{delay:>4}ms")
+            };
+            Span::styled(
+                format!("[●|{text}]"),
+                Style::default().fg(delay_color(delay)),
+            )
+        }
+        None => Span::styled("[·|   ---]", Style::default().fg(MUTED)),
+    }
 }
 
 fn log_color(level: &str) -> Color {
@@ -1600,13 +1586,18 @@ mod tests {
         app.tab = Tab::Proxies;
         let screen = render(&app, 100, 30);
 
-        assert!(screen.contains("node-a"), "members are listed");
-        assert!(screen.contains("node-b"));
         assert!(
-            screen.contains("▶ node-a"),
-            "the active member is marked: {screen}"
+            screen.contains("▶ [●|  42ms] node-a"),
+            "the active member is marked and its delay prefix comes before the name: {screen}"
         );
-        assert!(screen.contains("42 ms"), "measured delay is shown");
+        assert!(
+            screen.contains("[·|   ---] node-b"),
+            "an untested member shows a placeholder prefix: {screen}"
+        );
+        assert!(
+            !screen.contains("42 ms"),
+            "delay is not repeated in a trailing column: {screen}"
+        );
         assert!(screen.contains("URLTest"), "group type is shown");
     }
 
@@ -1716,16 +1707,62 @@ mod tests {
     }
 
     #[test]
-    fn delay_bars_shrink_as_latency_grows() {
-        let fast = delay_bar(Some(50)).content.to_string();
-        let slow = delay_bar(Some(950)).content.to_string();
-        let none = delay_bar(None).content.to_string();
+    fn the_status_prefix_colours_latency_and_marks_untested_members() {
+        assert_eq!(delay_prefix(Some(42)).content, "[●|  42ms]");
+        assert_eq!(
+            delay_prefix(Some(42)).style.fg,
+            Some(Color::Green),
+            "fast nodes are green"
+        );
+        assert_eq!(
+            delay_prefix(Some(300)).style.fg,
+            Some(Color::Yellow),
+            "middling nodes are yellow"
+        );
+        assert_eq!(
+            delay_prefix(Some(700)).style.fg,
+            Some(Color::LightRed),
+            "slow nodes are light red"
+        );
+        assert_eq!(
+            delay_prefix(Some(1500)).style.fg,
+            Some(Color::Red),
+            "very slow nodes are red"
+        );
 
-        assert_eq!(fast.chars().count(), 10, "bars are a fixed width");
-        assert_eq!(slow.chars().count(), 10);
-        assert_ne!(fast, slow, "a fast node fills more of the bar");
-        assert!(fast.starts_with('█'));
-        assert!(none.contains('·'), "an untested node shows dots");
+        let untested = delay_prefix(None);
+        assert_eq!(untested.content, "[·|   ---]");
+        assert_eq!(untested.style.fg, Some(MUTED), "untested nodes are muted");
+    }
+
+    #[test]
+    fn status_prefixes_share_a_width_so_names_line_up() {
+        let fast = delay_prefix(Some(42)).content.to_string();
+        let slow = delay_prefix(Some(999)).content.to_string();
+        let untested = delay_prefix(None).content.to_string();
+
+        assert_eq!(slow, "[●| 999ms]");
+        assert_eq!(
+            fast.chars().count(),
+            slow.chars().count(),
+            "different delays take the same width: {fast} vs {slow}"
+        );
+        assert_eq!(
+            fast.chars().count(),
+            untested.chars().count(),
+            "untested placeholders take the same width: {fast} vs {untested}"
+        );
+
+        let huge = delay_prefix(Some(10_000));
+        assert_eq!(
+            huge.content, "[●|>999ms]",
+            "delays past four digits are clipped to keep the width"
+        );
+        assert_eq!(
+            fast.chars().count(),
+            huge.content.chars().count(),
+            "even huge delays keep the fixed width"
+        );
     }
 
     #[test]
