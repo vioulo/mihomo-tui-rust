@@ -6,6 +6,8 @@ mihomo（Clash.Meta）外部控制器的终端界面。
 
 它对接的是 mihomo Web 面板用的那套 REST API，所以只要能开 `external-controller`，就能直接用——不需要额外装 agent，也不用改配置以外的东西。
 
+![Proxies 标签页](imgs/mark-shot-20261027-180018.png)
+
 ## 功能
 
 五个标签页，用 `1`–`5` 或 `tab` 切换：
@@ -13,12 +15,30 @@ mihomo（Clash.Meta）外部控制器的终端界面。
 | 标签页 | 内容 |
 | --- | --- |
 | **Overview** | 版本、当前路由模式、入站端口、日志级别 / LAN / IPv6 / TUN 开关，实时上下行速率与波形图，累计流量 |
-| **Proxies** | 所有分组及其成员，带实测延迟和延迟条；选中节点、单节点测速、整组测速 |
+| **Proxies** | 所有分组及其成员，节点名前带按延迟着色的 `[●|42ms]` 状态前缀；选中节点、单节点测速、整组测速 |
 | **Connections** | 实时连接表（目标、类型、代理链、进程、上下行、命中规则）加详情面板；关闭单条或全部连接 |
 | **Logs** | 实时 `/logs` 流，按级别着色 |
 | **Subscriptions** | 导入/更新/删除订阅，按块 diff 合并 base 配置并热加载，策略记忆与并发测速 |
 
 界面是单线程渲染循环，所有网络 I/O 都在后台任务里、通过一对 channel 通信，所以控制器慢也不会卡住界面。`/traffic` 和 `/logs` 两条流在断开后会自动重连（mihomo 每次重载配置都会断它们）。
+
+## 截图
+
+**Overview** — 版本、当前模式、实时流量曲线与自定义规则。
+
+![Overview](imgs/mark-shot-20261027-175950.png)
+
+**Connections** — 实时连接表；`x` / `X` 关闭单条或全部连接。
+
+![Connections](imgs/mark-shot-20261027-180104.png)
+
+**Subscriptions** — 订阅列表、节点数、协议与策略。
+
+![Subscriptions](imgs/mark-shot-20261027-180126.png)
+
+**Settings / Options** — 不用离开终端就能切换模式、端口、TUN、局域网与自定义规则。
+
+![Settings / Options](imgs/mark-shot-20261027-180214.png)
 
 ## 环境要求
 
@@ -108,7 +128,7 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 
 | 按键 | 作用 |
 | --- | --- |
-| `1`–`4` / `tab` / `shift-tab` | 切换标签页 |
+| `1`–`5` / `tab` / `shift-tab` | 切换标签页 |
 | `q` / `ctrl-c` | 退出 |
 | `r` | 立即刷新 |
 | `m` / `M` | 向后 / 向前切换路由模式 *(Overview)* |
@@ -150,7 +170,6 @@ TUI 维护自己的 `base.yaml`，导入的订阅快照缓存在 `~/.config/miho
 ```
 
 ## 开发
-## 开发
 
 ```sh
 cargo test               # 单元测试 + 渲染快照测试
@@ -172,7 +191,7 @@ cargo fmt
 6. ~~配置持久化~~ — `config.json` 已落地（并发数、鼠标），其余仍待补充
 7. **CI** — 加个 GitHub Actions 跑 `fmt` / `clippy` / `test`，防止回归。
 
-一些更小的点：延迟条的 1000ms 满刻度是硬编码的；流量波形固定 120 个采样，不随终端宽度自适应；颜色主题也是写死的。
+一些更小的点：流量波形固定 120 个采样，不随终端宽度自适应；颜色主题也是写死的。
 
 ---
 

@@ -7,6 +7,8 @@ external controller. It talks to the same REST API the web dashboard uses, so it
 works against any mihomo instance that exposes `external-controller` — no extra
 agent, no config changes beyond the controller block.
 
+![Proxies tab](imgs/mark-shot-20261027-180018.png)
+
 ## Features
 
 Five tabs, switchable with `1`–`5` or `tab`:
@@ -14,7 +16,7 @@ Five tabs, switchable with `1`–`5` or `tab`:
 | Tab | What it shows |
 | --- | --- |
 | **Overview** | Version, current routing mode, inbound ports, log level / LAN / IPv6 / TUN flags, live up/down rates with sparklines, cumulative transfer totals |
-| **Proxies** | Every selector-ish group and its members, each with measured delay and a latency bar; select a member, test one member or the whole group |
+| **Proxies** | Every selector-ish group and its members, each node led by a `[●|42ms]` status prefix coloured by latency; select a member, test one member or the whole group |
 | **Connections** | Live connection table (destination, type, proxy chain, process, up/down, matched rule) with a detail pane; close one or all |
 | **Logs** | The live `/logs` stream, colour-coded by level |
 | **Subscriptions** | Import/update/delete subscriptions; per-block diff and merge of the base config with hot reload, remembered policy, concurrent testing |
@@ -23,6 +25,24 @@ The UI is a single-threaded render loop; all network I/O happens on background
 tasks behind a pair of channels, so nothing blocks on a slow controller. The
 `/traffic` and `/logs` streams reconnect on their own when mihomo drops them
 (which it does on every config reload).
+
+## Screenshots
+
+**Overview** — version, current mode, live traffic curve, and custom rules.
+
+![Overview](imgs/mark-shot-20261027-175950.png)
+
+**Connections** — live connections; `x` / `X` closes one or all.
+
+![Connections](imgs/mark-shot-20261027-180104.png)
+
+**Subscriptions** — subscriptions, node counts, protocols, and policy.
+
+![Subscriptions](imgs/mark-shot-20261027-180126.png)
+
+**Settings / Options** — switch mode, port, TUN, LAN, and custom rules without leaving the terminal.
+
+![Settings / Options](imgs/mark-shot-20261027-180214.png)
 
 ## Requirements
 
@@ -72,7 +92,7 @@ mihomo-tui --endpoint 192.168.1.10:9090 --refresh 1000 --log-level warning
 
 | Key | Action |
 | --- | --- |
-| `1`–`4` / `tab` / `shift-tab` | Switch tab |
+| `1`–`5` / `tab` / `shift-tab` | Switch tab |
 | `q` / `ctrl-c` | Quit |
 | `r` | Refresh now |
 | `m` / `M` | Cycle routing mode forward / back *(Overview)* |
@@ -125,7 +145,6 @@ Watching is a 1-second poll of `(mtime, size)` — no extra dependency.
   subscriptions/     # one snapshot per subscription (0600)
 ```
 
-## Development
 ## Development
 
 ```sh
